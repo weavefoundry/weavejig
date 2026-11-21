@@ -29,7 +29,7 @@ impl Output {
 
     /// Writes a space, unless the next text will start a line.
     fn space(&mut self) {
-        if self.pending == 0 && !self.text.is_empty() {
+        if self.pending == 0 && !self.text.is_empty() && !self.text.ends_with(' ') {
             self.write(" ");
         }
     }

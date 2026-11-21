@@ -182,6 +182,17 @@ impl<'a> Formatter<'a> {
         };
         let mut docs = Vec::new();
         if self.skip_leading.get() != Some(token.text_range().start()) {
+            // `null /* why */)`: a comment after code on its line is set
+            // off from it, except right after an opening bracket.
+            let same_line = trivia
+                .leading
+                .first()
+                .is_some_and(|comment| comment.newlines_before == 0);
+            let after_open = weavejig_syntax::prev_significant_token(token)
+                .is_none_or(|previous| matches!(previous.kind(), L_PAREN | L_BRACK));
+            if same_line && !after_open {
+                docs.push(space());
+            }
             self.leading_comments(trivia, Some(token.kind()), &mut docs);
         }
         docs.push(text(token.text()));
@@ -784,7 +795,11 @@ impl<'a> Formatter<'a> {
     /// will move above it because the declaration is too long for one line.
     /// Such a field is set off by blank lines.
     fn field_wraps_annotations(&self, field: &SyntaxNode) -> bool {
-        let Some((declaration, semi, true)) = self.var_decl_parts(field) else {
+        let first = first_token(field).map(|first| first.text_range().start());
+        let previous = self.skip_leading.replace(first);
+        let parts = self.var_decl_parts(field);
+        self.skip_leading.set(previous);
+        let Some((declaration, semi, true)) = parts else {
             return false;
         };
         // Fields sit in class bodies, so their indentation is known.
@@ -1165,7 +1180,12 @@ impl<'a> Formatter<'a> {
         for (i, part) in header.split(|el| el.kind() == SEMI).enumerate() {
             if i > 0 {
                 inner.push(text(";"));
-                inner.push(Doc::Line);
+                // `for (...; ...; )`: nothing to put on a line of its own.
+                inner.push(if i == 2 && part.is_empty() {
+                    space()
+                } else {
+                    Doc::Line
+                });
             }
             inner.push(self.spaced(part));
         }
@@ -1550,14 +1570,17 @@ impl<'a> Formatter<'a> {
             return Some(concat(vec![self.element(open), self.element(close)]));
         }
         let continuation = self.continuation_indent();
-        let wrapped = |inner: Doc| {
+        let wrapped = |build: &dyn Fn() -> Doc| {
+            let (mut before, inner) = self.with_first_comments_apart(items, build);
             let inner = match one_per_line {
                 Some(tag) => tagged_group(tag, inner),
                 None => group(inner),
             };
+            before.insert(0, Doc::SoftLine);
+            before.push(inner);
             concat(vec![
                 self.element(open),
-                group(indent(continuation, concat(vec![Doc::SoftLine, inner]))),
+                group(indent(continuation, concat(before))),
                 self.element(close),
             ])
         };
@@ -1596,7 +1619,7 @@ impl<'a> Formatter<'a> {
             ]));
         }
         if node.kind() != ARG_LIST {
-            return Some(wrapped(self.comma_separated(items)));
+            return Some(wrapped(&|| self.comma_separated(items)));
         }
 
         if let [NodeOrToken::Node(only)] = items
@@ -1642,19 +1665,17 @@ impl<'a> Formatter<'a> {
             ]));
         }
         if self.fills(&arguments) {
-            return Some(wrapped(self.filled(&arguments)));
+            return Some(wrapped(&|| self.filled(&arguments)));
         }
         if let Some((first, others)) = arguments.split_first()
             && others.len() > 1
             && is_format_string(first)
         {
-            return Some(wrapped(concat(vec![
-                self.spaced(first),
-                Doc::Line,
-                self.filled(others),
-            ])));
+            return Some(wrapped(&|| {
+                concat(vec![self.spaced(first), Doc::Line, self.filled(others)])
+            }));
         }
-        Some(wrapped(self.comma_separated(items)))
+        Some(wrapped(&|| self.comma_separated(items)))
     }
 
     /// Items, each with its comma, that fill lines: a line break goes only
@@ -1669,49 +1690,75 @@ impl<'a> Formatter<'a> {
     }
 
     /// Whether an item of a list is short enough for the list to be filled:
-    /// under ten characters.
+    /// under ten characters as printed, with no comment inside it or
+    /// between it and its comma.
     fn is_short(&self, item: &[SyntaxElement]) -> bool {
-        let tokens: Vec<SyntaxToken> = item
-            .iter()
-            .flat_map(|element| match element {
-                NodeOrToken::Node(node) => node
-                    .descendants_with_tokens()
-                    .filter_map(|el| el.into_token())
-                    .filter(|token| !token.kind().is_trivia())
-                    .collect(),
-                NodeOrToken::Token(token) => vec![token.clone()],
+        let Some(value) = item.first() else {
+            return false;
+        };
+        let tokens: Vec<SyntaxToken> = match value {
+            NodeOrToken::Node(node) => node
+                .descendants_with_tokens()
+                .filter_map(|el| el.into_token())
+                .filter(|token| !token.kind().is_trivia())
+                .collect(),
+            NodeOrToken::Token(token) => vec![token.clone()],
+        };
+        let last = tokens.len().saturating_sub(1);
+        let commented = tokens.iter().enumerate().any(|(i, token)| {
+            self.trivia(token).is_some_and(|t| {
+                (i > 0 && !t.leading.is_empty()) || (i < last && !t.trailing.is_empty())
             })
-            .collect();
-        let width: usize = tokens
+        }) || item[1..]
             .iter()
-            .filter(|token| token.kind() != COMMA)
-            .map(|token| token.text().chars().count())
+            .filter_map(|el| el.as_token())
+            .any(|comma| self.trivia(comma).is_some_and(|t| !t.leading.is_empty()));
+        let text = value.to_string();
+        let width: usize = text
+            .split_whitespace()
+            .map(|word| word.chars().count() + 1)
             .sum();
-        width < 10
-    }
-
-    /// Whether a comment sits between the items of a list: before an item,
-    /// or after its comma.
-    fn has_comments_between(&self, items: &[&[SyntaxElement]]) -> bool {
-        items.iter().any(|item| {
-            let leading = item
-                .first()
-                .and_then(first_of)
-                .and_then(|first| self.trivia(&first).map(|t| !t.leading.is_empty()));
-            let trailing = item
-                .last()
-                .and_then(last_of)
-                .and_then(|last| self.trivia(&last).map(|t| !t.trailing.is_empty()));
-            leading == Some(true) || trailing == Some(true)
-        })
+        !commented && width.saturating_sub(1) < 10
     }
 
     /// Whether the items of a list fill lines rather than take one each:
-    /// when all are short, or when comments stand between them. A comment
-    /// ends its line without making every other item take a line too.
+    /// when all are short, and no comment has a line to itself among them.
     fn fills(&self, items: &[&[SyntaxElement]]) -> bool {
-        items.iter().all(|item| self.is_short(item))
-            || (items.len() > 1 && self.has_comments_between(items))
+        items.iter().enumerate().all(|(i, item)| {
+            let own_line_comment = item
+                .first()
+                .and_then(first_of)
+                .is_some_and(|first| self.trivia(&first).is_some_and(|t| !t.leading.is_empty()));
+            self.is_short(item) && (i == 0 || !own_line_comment)
+        })
+    }
+
+    /// Builds the items of a list with `build`, having taken out the
+    /// comments in front of the first item: they are returned apart, to be
+    /// printed where they do not make the items take a line each.
+    fn with_first_comments_apart(
+        &self,
+        items: &[SyntaxElement],
+        build: impl FnOnce() -> Doc,
+    ) -> (Vec<Doc>, Doc) {
+        let first = items.first().and_then(first_of);
+        let trivia = first
+            .as_ref()
+            .and_then(|first| self.trivia(first))
+            .filter(|trivia| !trivia.leading.is_empty());
+        let (Some(first), Some(trivia)) = (first.as_ref(), trivia) else {
+            return (Vec::new(), build());
+        };
+        let start = first.text_range().start();
+        if self.skip_leading.get() == Some(start) {
+            return (Vec::new(), build());
+        }
+        let mut comments = Vec::new();
+        self.leading_comments(trivia, Some(first.kind()), &mut comments);
+        let previous = self.skip_leading.replace(Some(start));
+        let doc = build();
+        self.skip_leading.set(previous);
+        (comments, doc)
     }
 
     /// Whether the source has the arguments two to a line, on at least two
