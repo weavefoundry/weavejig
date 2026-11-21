@@ -49,14 +49,14 @@ fn candidates() -> Vec<Jdk> {
         }
     }
     paths.push(PathBuf::from("java"));
-    if cfg!(target_os = "macos") {
-        if let Ok(output) = Command::new("/usr/libexec/java_home").arg("-V").output() {
-            // Lines look like: `21.0.4 (arm64) "Vendor" - "Name" /path/to/Home`
-            let listing = String::from_utf8_lossy(&output.stderr).into_owned();
-            for line in listing.lines() {
-                if let Some(home) = line.rsplit(' ').next().filter(|home| home.starts_with('/')) {
-                    paths.push(PathBuf::from(home).join("bin").join("java"));
-                }
+    if cfg!(target_os = "macos")
+        && let Ok(output) = Command::new("/usr/libexec/java_home").arg("-V").output()
+    {
+        // Lines look like: `21.0.4 (arm64) "Vendor" - "Name" /path/to/Home`
+        let listing = String::from_utf8_lossy(&output.stderr).into_owned();
+        for line in listing.lines() {
+            if let Some(home) = line.rsplit(' ').next().filter(|home| home.starts_with('/')) {
+                paths.push(PathBuf::from(home).join("bin").join("java"));
             }
         }
     }

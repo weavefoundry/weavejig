@@ -297,14 +297,14 @@ fn try_stmt(p: &mut Parser<'_>) {
         p.expect(L_PAREN);
         let param = p.start();
         modifiers(p, false);
-        if let Some(first) = types::type_(p) {
-            if p.at(PIPE) {
-                let union = first.precede(p);
-                while p.eat(PIPE) {
-                    types::type_(p);
-                }
-                union.complete(p, UNION_TYPE);
+        if let Some(first) = types::type_(p)
+            && p.at(PIPE)
+        {
+            let union = first.precede(p);
+            while p.eat(PIPE) {
+                types::type_(p);
             }
+            union.complete(p, UNION_TYPE);
         }
         p.expect(IDENT);
         param.complete(p, PARAM);

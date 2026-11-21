@@ -138,14 +138,14 @@ fn unary(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         L_PAREN if at_cast(p) => {
             let m = p.start();
             p.bump();
-            if let Some(first) = types::type_(p) {
-                if p.at(AMP) {
-                    let intersection = first.precede(p);
-                    while p.eat(AMP) {
-                        types::type_(p);
-                    }
-                    intersection.complete(p, INTERSECTION_TYPE);
+            if let Some(first) = types::type_(p)
+                && p.at(AMP)
+            {
+                let intersection = first.precede(p);
+                while p.eat(AMP) {
+                    types::type_(p);
                 }
+                intersection.complete(p, INTERSECTION_TYPE);
             }
             p.expect(R_PAREN);
             unary(p);
