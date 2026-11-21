@@ -1,0 +1,61 @@
+# What `cargo xtask score` measures WeaveJig against.
+#
+# Everything here is pinned, so that a score means the same thing on every
+# machine. `cargo xtask fetch` downloads these into `.weavejig/`.
+
+# --- Reference tools ----------------------------------------------------------
+#
+# To move to a new release, update `version`, `url` and `sha256` together. The
+# checksum is the one GitHub publishes for the release asset.
+
+[references.google-java-format]
+version = "2.0.0"
+url = "https://github.com/google/google-java-format/releases/download/v2.0.0/google-java-format-2.0.0-all-deps.jar"
+sha256 = "c78feb48c549fa7114b7ea11db3b456808f7b371ffe84e6643a44dd2f9588639"
+min-jdk = 21
+
+[references.checkstyle]
+version = "14.4.0"
+url = "https://github.com/checkstyle/checkstyle/releases/download/checkstyle-14.4.0/checkstyle-14.4.0-all.jar"
+sha256 = "c0a521e54eabd1ece4ff7bd84cf231b012615745ed3aa4fb27ab0ca73097250c"
+min-jdk = 21
+
+# --- Corpus -------------------------------------------------------------------
+#
+# Open-source Java, pinned by commit. Each codebase belongs to one set:
+#
+#   dev       Used freely during development: read the mismatches, fix them.
+#   held-out  Never looked at. `cargo xtask score --set held-out` prints only
+#             the totals, so the numbers stay an honest measure of how well
+#             WeaveJig generalises. Do not debug against these, and do not move
+#             a codebase from held-out to dev to "fix" a score.
+
+[[corpus]]
+name = "guava"
+url = "https://github.com/google/guava.git"
+rev = "309d377f8178f54af3e2cf893c3c4d2014e537c5" # v33.8.0
+set = "dev"
+
+[[corpus]]
+name = "commons-lang"
+url = "https://github.com/apache/commons-lang.git"
+rev = "562de6e40e0742f471adefcf05bd4b273d995028" # rel/commons-lang-3.22.0
+set = "dev"
+
+[[corpus]]
+name = "gson"
+url = "https://github.com/google/gson.git"
+rev = "fcd416909db2bea96eb916bcfb2d0a83cb9b86c3" # gson-parent-2.15.0
+set = "dev"
+
+[[corpus]]
+name = "error-prone"
+url = "https://github.com/google/error-prone.git"
+rev = "5c3574f9d796d44b95154b865d268f102104a015" # v2.53.0
+set = "held-out"
+
+[[corpus]]
+name = "jackson-core"
+url = "https://github.com/FasterXML/jackson-core.git"
+rev = "65af7eac00362fbf0ef400b6017f88e85e62afd2" # jackson-core-3.3.0
+set = "held-out"
