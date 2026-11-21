@@ -17,6 +17,7 @@ public class Long<T> extends Base<T> implements Runnable, Comparable<Long<T>> {
 
   /**
    * Misindented javadoc.
+   *
    * @param a first
    */
   @Override

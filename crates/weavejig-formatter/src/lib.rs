@@ -13,6 +13,7 @@
 mod comments;
 mod doc;
 mod format;
+mod javadoc;
 mod printer;
 mod spacing;
 mod verify;

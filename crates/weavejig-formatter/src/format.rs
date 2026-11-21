@@ -100,30 +100,26 @@ fn comment_doc(comment: &Comment, trailing: bool) -> Doc {
             text(line)
         };
     }
+    if comment.is_javadoc() && !comment.text.starts_with("/***") {
+        return Doc::Javadoc(comment.text.clone());
+    }
     let lines: Vec<&str> = comment.text.lines().collect();
     if lines.len() < 2 {
         return text(comment.text.clone());
     }
-    // Javadoc-style comments, where every line starts with `*`, are
-    // re-indented so the stars line up. Anything else is kept verbatim.
-    if lines[1..]
-        .iter()
-        .all(|line| line.trim_start().starts_with('*'))
-    {
-        let mut docs = vec![text(lines[0].trim_end())];
-        for line in &lines[1..] {
-            docs.push(Doc::HardLine);
-            docs.push(text(format!(" {}", line.trim())));
-        }
-        return concat(docs);
+    // Later lines line up with the comment's start: under the `/` if they
+    // are plain text, one column in if they start with `*`.
+    let mut docs = vec![text(lines[0].trim_end())];
+    for line in &lines[1..] {
+        let line = line.trim();
+        docs.push(Doc::HardLine);
+        docs.push(text(if line.starts_with('*') {
+            format!(" {line}")
+        } else {
+            line.to_string()
+        }));
     }
-    text(
-        lines
-            .iter()
-            .map(|line| line.trim_end())
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+    concat(docs)
 }
 
 impl<'a> Formatter<'a> {

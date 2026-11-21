@@ -11,10 +11,11 @@ struct Fingerprint {
     /// Import declarations, sorted and without duplicates, since the
     /// formatter reorders and deduplicates them.
     imports: Vec<String>,
-    /// The words of all comments, sorted: comments travel with imports, and
-    /// are re-indented and re-wrapped. Comment markers and paragraph tags,
-    /// which wrapping adds and removes, are left out.
-    comments: Vec<String>,
+    /// The characters of all comments, sorted: comments travel with imports
+    /// and are re-indented and re-wrapped, so neither order nor whitespace
+    /// can be compared. Comment markers, and the tags Javadoc reflow adds
+    /// and removes, are left out.
+    comments: Vec<char>,
 }
 
 fn fingerprint(text: &str) -> Fingerprint {
@@ -48,29 +49,58 @@ fn fingerprint(text: &str) -> Fingerprint {
     fingerprint.imports.extend(import);
     fingerprint.imports.sort();
     fingerprint.imports.dedup();
-    fingerprint.comments.sort();
+    fingerprint.comments.sort_unstable();
     fingerprint
 }
 
-/// Adds the words of a comment to `words`, leaving out what re-wrapping a
-/// comment may add or remove: `//`, `/*`, `*/`, the `*` that starts a line,
-/// and `<p>` tags.
-fn comment_words(comment: &str, words: &mut Vec<String>) {
-    for line in comment.lines() {
-        let mut line = line.trim();
-        if line.starts_with("//") {
-            line = line.trim_start_matches('/');
-        } else if let Some(rest) = line.strip_prefix("/*") {
-            line = rest;
+/// Adds the characters of a comment to `chars`, leaving out what re-wrapping
+/// a comment may add or remove: whitespace, `//`, `/*`, `*/`, the `*` that
+/// starts a line, and the tags Javadoc reflow normalises.
+fn comment_words(comment: &str, chars: &mut Vec<char>) {
+    // Tags that reflow drops, adds, or rewrites (`<br/>` becomes `<br>`).
+    const DROPPED: [&str; 6] = ["<p>", "</p>", "<p/>", "</li>", "</dt>", "</dd>"];
+    let is_line_comment = comment.starts_with("//");
+    let body = comment
+        .strip_prefix("/*")
+        .and_then(|body| body.strip_suffix("*/"))
+        .unwrap_or(comment);
+    for line in body.lines() {
+        let line = line.trim();
+        let line = if is_line_comment {
+            line.trim_start_matches('/')
+        } else {
+            // One `*` starts the line; any more belong to the text.
+            line.strip_prefix('*').unwrap_or(line)
+        };
+        let mut rest = line;
+        'scan: while let Some(first) = rest.chars().next() {
+            if first == '<' {
+                let lower: String = rest
+                    .chars()
+                    .take(6)
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                for tag in DROPPED {
+                    if lower.starts_with(tag) {
+                        rest = &rest[tag.len()..];
+                        continue 'scan;
+                    }
+                }
+                if lower.starts_with("<br")
+                    && let Some(end) = rest
+                        .find('>')
+                        .filter(|&end| rest[3..end].chars().all(|c| c == '/' || c.is_whitespace()))
+                {
+                    chars.extend("<br>".chars());
+                    rest = &rest[end + 1..];
+                    continue 'scan;
+                }
+            }
+            if !first.is_whitespace() {
+                chars.push(first);
+            }
+            rest = &rest[first.len_utf8()..];
         }
-        let line = line.strip_suffix("*/").unwrap_or(line);
-        let line = line.trim_start().trim_start_matches('*');
-        let line = line
-            .replace("<p>", " ")
-            .replace("</p>", " ")
-            .replace("<P>", " ")
-            .replace("</P>", " ");
-        words.extend(line.split_whitespace().map(str::to_string));
     }
 }
 

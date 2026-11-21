@@ -96,6 +96,22 @@ pub(crate) fn print(doc: &Doc, line_width: usize) -> String {
                 };
                 stack.push((indent + extra, flat, doc));
             }
+            Doc::Javadoc(comment) => {
+                let column = if out.pending > 0 {
+                    out.pending_indent
+                } else {
+                    out.column
+                };
+                for (i, line) in crate::javadoc::format(comment, column, line_width)
+                    .iter()
+                    .enumerate()
+                {
+                    if i > 0 {
+                        out.newline(1, column);
+                    }
+                    out.write(line);
+                }
+            }
             Doc::LineComment(comment) => {
                 let column = if out.pending > 0 {
                     out.pending_indent
@@ -219,7 +235,7 @@ fn fits(doc: &Doc, rest: &[(usize, bool, &Doc)], mut remaining: isize) -> bool {
             },
         };
         match doc {
-            Doc::Text(text) => match text.find('\n') {
+            Doc::Text(text) | Doc::Javadoc(text) => match text.find('\n') {
                 Some(newline) => return remaining >= width(&text[..newline]) as isize,
                 None => remaining -= width(text) as isize,
             },

@@ -51,6 +51,8 @@ pub(crate) enum Doc {
     /// A `//` comment on a line of its own, which is wrapped at the line
     /// width.
     LineComment(String),
+    /// A `/** ... */` comment, which is reflowed for the column it lands on.
+    Javadoc(String),
 }
 
 /// Names a [`Doc::TaggedGroup`].
@@ -73,6 +75,7 @@ impl Doc {
             | Doc::FillBreak(_, forced)
             | Doc::NextLineIfFits(_, _, forced) => *forced,
             Doc::LineComment(_) => false,
+            Doc::Javadoc(text) => text.contains('\n'),
         }
     }
 }
