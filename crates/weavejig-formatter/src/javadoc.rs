@@ -420,6 +420,8 @@ impl Writer {
                 self.has_block_tag = true;
                 self.last = Last::Text;
             }
+            // A comment does not start with a paragraph mark.
+            Token::ParagraphOpen(None) if !self.wrote_anything => self.attach = true,
             Token::ParagraphOpen(tag) => {
                 self.request(Gap::BlankLine);
                 self.write(tag.unwrap_or("<p>"), indent);

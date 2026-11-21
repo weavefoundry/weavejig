@@ -452,6 +452,12 @@ impl<'a> Formatter<'a> {
             .last()?
             .as_token()
             .filter(|t| t.kind() == R_BRACE)?;
+        if open + 2 == elements.len() && !self.has_dangling_comments(close) {
+            return Some(concat(vec![
+                self.spaced(&elements[..=open]),
+                self.token(close),
+            ]));
+        }
         let mut body = Vec::new();
         for directive in elements[open + 1..elements.len() - 1].iter() {
             body.push(
@@ -960,7 +966,11 @@ impl<'a> Formatter<'a> {
                         && weavejig_syntax::prev_significant_token(token)
                             .is_some_and(|previous| previous.kind() == COMMA);
                     if previous.is_none() || after_comma {
-                        body.push(Doc::HardLine);
+                        body.push(if after_comma && self.blank_line_before(token) {
+                            Doc::BlankLine
+                        } else {
+                            Doc::HardLine
+                        });
                     }
                     body.push(self.token(token));
                     continue;
@@ -1088,7 +1098,13 @@ impl<'a> Formatter<'a> {
                     _ => false,
                 }
             });
-        self.dangling_comments(close, &mut body);
+        if node.kind() == SWITCH_BLOCK {
+            let mut comments = Vec::new();
+            self.dangling_comments(close, &mut comments);
+            body.push(indent(self.block_indent(), concat(comments)));
+        } else {
+            self.dangling_comments(close, &mut body);
+        }
         Some(concat(vec![
             self.token(open),
             indent(self.block_indent(), concat(body)),
@@ -1490,17 +1506,14 @@ impl<'a> Formatter<'a> {
         // What an array access is made of is laid out on its own.
         let simple_base = matches!(
             base_kind,
-            Some(NAME_EXPR | THIS_EXPR | SUPER_EXPR | ARRAY_ACCESS)
+            Some(NAME_EXPR | THIS_EXPR | SUPER_EXPR | ARRAY_ACCESS | CLASS_LITERAL)
         );
         let lone_call = simple_base && calls == 1 && links.last().is_some_and(is_call);
-        if rest.is_empty() || (calls == 0 && rest.len() < 2) {
-            head.extend(rest.iter().map(|link| self.spaced(link)));
-            return concat(head);
-        }
-
         let tag = self.tag();
-        if lone_call {
-            let (last, fields) = rest.split_last().expect("rest is not empty");
+        if lone_call && let Some((last, fields)) = links.split_last() {
+            // Even a dot that belongs to the head gives way if `.name(`
+            // does not fit after what comes before it.
+            let mut head = vec![self.spaced(&base_elements)];
             head.extend(fields.iter().map(|link| self.spaced(link)));
             let arguments = last
                 .iter()
@@ -1518,6 +1531,10 @@ impl<'a> Formatter<'a> {
                 self.continuation_indent(),
                 self.spaced(&last[arguments..]),
             ));
+            return concat(head);
+        }
+        if rest.is_empty() || (calls == 0 && rest.len() < 2) {
+            head.extend(rest.iter().map(|link| self.spaced(link)));
             return concat(head);
         }
 
