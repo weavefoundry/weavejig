@@ -398,13 +398,15 @@ fn new_expr(p: &mut Parser<'_>, m: Marker) -> CompletedMarker {
         types::type_args(p);
     }
     types::type_no_dims(p);
-    if p.at(L_BRACK) {
-        while p.at(L_BRACK) {
-            if p.nth(1) == R_BRACK {
-                p.bump();
-                p.bump();
+    if types::at_bracket(p) {
+        while types::at_bracket(p) {
+            if types::at_dim(p) {
+                types::dim(p);
             } else {
                 let dim = p.start();
+                while p.at(AT) {
+                    annotation(p);
+                }
                 p.bump();
                 expr(p);
                 p.expect(R_BRACK);

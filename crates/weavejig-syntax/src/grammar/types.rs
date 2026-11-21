@@ -12,13 +12,33 @@ pub(super) fn at_type_start(p: &Parser<'_>) -> bool {
 /// A type, including array dimensions.
 pub(super) fn type_(p: &mut Parser<'_>) -> Option<CompletedMarker> {
     let mut ty = type_no_dims(p)?;
-    while p.at(L_BRACK) && p.nth(1) == R_BRACK {
+    while at_dim(p) {
         let m = ty.precede(p);
-        p.bump();
-        p.bump();
+        dim(p);
         ty = m.complete(p, ARRAY_TYPE);
     }
     Some(ty)
+}
+
+/// Whether `[` comes next, possibly after annotations: `int @Nullable []`.
+pub(super) fn at_bracket(p: &Parser<'_>) -> bool {
+    p.kind_at(la_annotations(p, p.pos())) == L_BRACK
+}
+
+/// Whether an empty pair of array brackets comes next, possibly after
+/// annotations.
+pub(super) fn at_dim(p: &Parser<'_>) -> bool {
+    let i = la_annotations(p, p.pos());
+    p.kind_at(i) == L_BRACK && p.kind_at(i + 1) == R_BRACK
+}
+
+/// `[]` with any annotations on it. The caller must have checked [`at_dim`].
+pub(super) fn dim(p: &mut Parser<'_>) {
+    while p.at(AT) {
+        annotation(p);
+    }
+    p.bump();
+    p.bump();
 }
 
 /// A type or `void`.

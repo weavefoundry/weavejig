@@ -443,9 +443,8 @@ fn declarators(p: &mut Parser<'_>) {
 
 /// Array brackets after a name, as in `int a[]`.
 fn dims(p: &mut Parser<'_>) {
-    while p.at(L_BRACK) && p.nth(1) == R_BRACK {
-        p.bump();
-        p.bump();
+    while types::at_dim(p) {
+        types::dim(p);
     }
 }
 

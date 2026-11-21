@@ -1,6 +1,6 @@
 //! Blocks and statements.
 
-use super::types::la_type;
+use super::types::{la_annotations, la_type};
 use super::{at_modifier, at_type_decl, declarators, exprs, modifiers, type_decl, types};
 use crate::SyntaxKind::*;
 use crate::parser::{Marker, Parser};
@@ -202,7 +202,12 @@ fn at_local_var_decl(p: &Parser<'_>) -> bool {
     match la_type(p, p.pos()) {
         Some(end) => {
             p.kind_at(end) == IDENT
-                && matches!(p.kind_at(end + 1), EQ | SEMI | COMMA | L_BRACK | COLON)
+                && match p.kind_at(end + 1) {
+                    EQ | SEMI | COMMA | L_BRACK | COLON => true,
+                    // `int a @A [] = ...`
+                    AT => p.kind_at(la_annotations(p, end + 1)) == L_BRACK,
+                    _ => false,
+                }
         }
         None => false,
     }

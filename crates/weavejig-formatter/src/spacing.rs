@@ -36,6 +36,9 @@ pub(crate) fn space_between(left: &SyntaxToken, right: &SyntaxToken) -> bool {
     }
 
     match rk {
+        // `int @Nullable []` and `String @NonNull ... args`: an annotation on
+        // array brackets or on a varargs ellipsis is set off from them.
+        L_BRACK | ELLIPSIS if follows_annotation(right) => return true,
         // An empty `for (;;)` header is written `for (; ; )`.
         SEMI | R_PAREN if rp == FOR_STMT && lk == SEMI => return true,
         SEMI | COMMA | R_PAREN | R_BRACK | DOT | ELLIPSIS | COLON_COLON | L_BRACK => return false,
@@ -59,6 +62,16 @@ pub(crate) fn space_between(left: &SyntaxToken, right: &SyntaxToken) -> bool {
         GT if lp == TYPE_ARGS => !matches!(grandparent_kind(left), METHOD_CALL | METHOD_REF),
         _ => true,
     }
+}
+
+/// Whether the element before `token` in its parent, ignoring whitespace and
+/// comments, is an annotation.
+fn follows_annotation(token: &SyntaxToken) -> bool {
+    std::iter::successors(token.prev_sibling_or_token(), |element| {
+        element.prev_sibling_or_token()
+    })
+    .find(|element| !element.kind().is_trivia())
+    .is_some_and(|element| element.kind() == ANNOTATION)
 }
 
 fn space_before_paren(left: &SyntaxToken, lk: SyntaxKind, lp: SyntaxKind) -> bool {

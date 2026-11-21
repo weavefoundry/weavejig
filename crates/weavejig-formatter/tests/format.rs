@@ -283,3 +283,17 @@ fn long_chains_do_not_overflow_the_stack() {
     let calls = format!("class C {{ Object x = a{}; }}", ".b()".repeat(3_000));
     assert!(fmt(&calls).lines().count() > 3_000);
 }
+
+#[test]
+fn annotated_array_brackets_are_set_off() {
+    assert_eq!(
+        fmt_statements(
+            "int @A[] a = new int @A[3] @B(1)[]; Object o = (Object @A[]) a; int  b  @A[];"
+        ),
+        "int @A [] a = new int @A [3] @B(1) [];\nObject o = (Object @A []) a;\nint b @A [];"
+    );
+    assert_eq!(
+        fmt("class C { void m(String @A... rest, int[] plain) {} }"),
+        "class C {\n  void m(String @A ... rest, int[] plain) {}\n}\n"
+    );
+}

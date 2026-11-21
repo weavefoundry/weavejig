@@ -251,6 +251,37 @@ fn switches_and_patterns() {
 }
 
 #[test]
+fn annotated_array_dimensions() {
+    accepts(
+        "class C { int @A [] f; @B Object @A [] @A(1) [] m(String @A [] a, int @A ... b) { return null; } }",
+    );
+    accepts("class C { ThreadLocal<int @A []> t; int legacy @A [] = {}, other @A [] @B []; }");
+    assert_eq!(
+        kinds_in_method("int @A [] a = new int @A [3] @B [];"),
+        [
+            LOCAL_VAR_DECL,
+            ARRAY_TYPE,
+            PRIMITIVE_TYPE,
+            ANNOTATION,
+            NAME,
+            VARIABLE_DECLARATOR,
+            ARRAY_CREATION_EXPR,
+            PRIMITIVE_TYPE,
+            DIM_EXPR,
+            ANNOTATION,
+            NAME,
+            LITERAL,
+            ANNOTATION,
+            NAME,
+        ]
+    );
+    // Old-style brackets after the name, and casts.
+    kinds_in_method("int a @A [] = {}; Object o = (Object @A []) a; for (int @A [] r : rows) {}");
+    // An annotation that is not followed by brackets does not belong to the type.
+    rejects("class C { int @A f; }");
+}
+
+#[test]
 fn contextual_keywords_are_identifiers() {
     accepts("class C { int record, var, yield, sealed, permits, when, module, open; }");
     accepts("class C { void m() { var var = 1; record = 2; yield = 3; sealed.permits(); } }");
