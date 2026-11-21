@@ -15,7 +15,7 @@ use weavejig_syntax::{
 
 use crate::FormatOptions;
 use crate::comments::{Comment, Comments, TokenTrivia};
-use crate::doc::{Doc, concat, group, indent, space, text};
+use crate::doc::{Doc, Tag, concat, group, indent, indent_if, space, tagged_group, text};
 use crate::spacing::space_between;
 
 pub(crate) struct Formatter<'a> {
@@ -26,6 +26,7 @@ pub(crate) struct Formatter<'a> {
     /// Simple names of imported annotations that are known to annotate types
     /// rather than declarations, such as JSpecify's `@Nullable`.
     type_annotations: HashSet<String>,
+    next_tag: Cell<Tag>,
 }
 
 /// Annotations that google-java-format keeps next to the type they annotate
@@ -120,7 +121,14 @@ impl<'a> Formatter<'a> {
             options,
             skip_leading: Cell::new(None),
             type_annotations,
+            next_tag: Cell::new(0),
         }
+    }
+
+    fn tag(&self) -> Tag {
+        let tag = self.next_tag.get();
+        self.next_tag.set(tag + 1);
+        tag
     }
 
     fn block_indent(&self) -> u16 {
@@ -825,51 +833,117 @@ impl<'a> Formatter<'a> {
 
     /// A chain of field accesses and method calls, such as `a.b().c()`.
     ///
-    /// The chain breaks before every `.` or before none, except that a
-    /// leading run of plain names and the first call on them stay together:
-    /// `System.out.println(...)` and `ImmutableList.builder()` never split.
+    /// The start of the chain, its *head*, never splits: `this.x`, a short
+    /// name and what follows it (`map.get(k)`), or a class name and what
+    /// follows it (`ImmutableList.builder()`, `System.out`). After the head:
+    ///
+    /// - A chain whose only call is its last link (`log.info(...)`,
+    ///   `this.cache.get(...)`) keeps its dots together, and breaks before
+    ///   the last one only if not even `.name(` fits.
+    /// - Any other chain breaks before every remaining `.` or before none.
+    ///
+    /// Once a chain has wrapped, line breaks inside its head are indented
+    /// once more, which sets the arguments of the first call apart from the
+    /// links that follow.
     fn chain(&self, node: &SyntaxNode) -> Doc {
         // Each link is `.name` or `.name(args)`, innermost receiver last.
         let mut links: Vec<Vec<SyntaxElement>> = Vec::new();
         let mut current = node.clone();
-        let (base, simple_base) = loop {
+        let (base, base_node) = loop {
             let elements: Vec<SyntaxElement> = significant_children(&current).collect();
             let receiver = match (elements.first(), elements.get(1)) {
                 (Some(NodeOrToken::Node(receiver)), Some(dot)) if dot.kind() == DOT => {
                     receiver.clone()
                 }
                 // A call without a receiver, such as `f(x)`.
-                _ => break (self.spaced(&elements), false),
+                _ => break (self.spaced(&elements), None),
             };
             links.push(elements[1..].to_vec());
             if matches!(receiver.kind(), METHOD_CALL | FIELD_ACCESS) {
                 current = receiver;
             } else {
-                let simple = matches!(receiver.kind(), NAME_EXPR | THIS_EXPR | SUPER_EXPR);
-                break (self.node(&receiver), simple);
+                break (self.node(&receiver), Some(receiver));
             }
         };
         links.reverse();
 
         let is_call = |link: &Vec<SyntaxElement>| link.iter().any(|el| el.kind() == ARG_LIST);
-        let attached = if simple_base {
-            let names = links.iter().take_while(|link| !is_call(link)).count();
-            (names + 1).min(links.len())
-        } else {
-            0
+        let name_of = |link: &Vec<SyntaxElement>| {
+            link.iter()
+                .find(|el| el.kind() == IDENT)
+                .map(|el| el.to_string())
         };
+        let base_kind = base_node.as_ref().map(|base| base.kind());
+        let attached = match base_kind {
+            Some(NAME_EXPR) => {
+                let base_name = base_node.as_ref().map_or(String::new(), |b| b.to_string());
+                let base_name = base_name.trim();
+                // The base and the plain names after it: a class name among
+                // them makes this a qualified name.
+                let mut names = vec![base_name.to_string()];
+                names.extend(
+                    links
+                        .iter()
+                        .take_while(|link| !is_call(link))
+                        .filter_map(name_of),
+                );
+                match names.iter().rposition(|name| is_class_name(name)) {
+                    Some(class) => class + 1,
+                    None if base_name.chars().count() <= 4 => 1,
+                    None => 0,
+                }
+            }
+            Some(THIS_EXPR | SUPER_EXPR) => 1,
+            _ => 0,
+        }
+        .min(links.len());
+
         let mut head = vec![base];
         head.extend(links[..attached].iter().map(|link| self.spaced(link)));
-        if attached == links.len() {
+        let rest = &links[attached..];
+        let calls = links.iter().filter(|link| is_call(link)).count();
+        let simple_base = matches!(base_kind, Some(NAME_EXPR | THIS_EXPR | SUPER_EXPR));
+        let lone_call = simple_base && calls == 1 && links.last().is_some_and(is_call);
+        if rest.is_empty() || (calls == 0 && rest.len() < 2) {
+            head.extend(rest.iter().map(|link| self.spaced(link)));
             return concat(head);
         }
-        let mut rest = Vec::new();
-        for link in &links[attached..] {
-            rest.push(Doc::SoftLine);
-            rest.push(self.spaced(link));
+
+        let tag = self.tag();
+        if lone_call {
+            let (last, fields) = rest.split_last().expect("rest is not empty");
+            head.extend(fields.iter().map(|link| self.spaced(link)));
+            let arguments = last
+                .iter()
+                .position(|el| el.kind() == ARG_LIST)
+                .unwrap_or(last.len());
+            head.push(tagged_group(
+                tag,
+                indent(
+                    self.continuation_indent(),
+                    concat(vec![Doc::SoftLine, self.spaced(&last[..arguments])]),
+                ),
+            ));
+            head.push(indent_if(
+                tag,
+                self.continuation_indent(),
+                self.spaced(&last[arguments..]),
+            ));
+            return concat(head);
         }
-        head.push(indent(self.continuation_indent(), concat(rest)));
-        group(concat(head))
+
+        let mut tail = Vec::new();
+        for link in rest {
+            tail.push(Doc::SoftLine);
+            tail.push(self.spaced(link));
+        }
+        tagged_group(
+            tag,
+            concat(vec![
+                indent_if(tag, self.continuation_indent(), concat(head)),
+                indent(self.continuation_indent(), concat(tail)),
+            ]),
+        )
     }
 
     /// A parenthesised, comma-separated list. If it does not fit after the
@@ -957,6 +1031,14 @@ impl<'a> Formatter<'a> {
             )),
         ]))
     }
+}
+
+/// Whether an identifier looks like a class name: `Foo` or `T`, but not
+/// `foo` or `MAX_VALUE`.
+fn is_class_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(char::is_uppercase)
+        && (chars.clone().next().is_none() || chars.any(char::is_lowercase))
 }
 
 /// The precedence class of a binary expression's operator. Operators in one

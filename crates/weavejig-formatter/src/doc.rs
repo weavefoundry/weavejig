@@ -28,7 +28,16 @@ pub(crate) enum Doc {
     /// Printed flat if it fits on the line, otherwise broken: every direct
     /// `Line` and `SoftLine` becomes a line break.
     Group(Box<Doc>, bool),
+    /// A group whose outcome [`Doc::IndentIf`] can refer to.
+    TaggedGroup(Tag, Box<Doc>, bool),
+    /// Indents like [`Doc::Indent`], but only if the group with this tag,
+    /// which must be printed earlier, was broken. This is how the arguments
+    /// of `a.b(...)` move further right once the chain after it wraps.
+    IndentIf(Tag, u16, Box<Doc>, bool),
 }
+
+/// Names a [`Doc::TaggedGroup`].
+pub(crate) type Tag = u32;
 
 impl Doc {
     /// Whether the document contains a mandatory line break, which forces
@@ -38,7 +47,11 @@ impl Doc {
             Doc::Text(text) => text.contains('\n'),
             Doc::Suffix(_) | Doc::Space | Doc::Line | Doc::SoftLine => false,
             Doc::HardLine | Doc::BlankLine => true,
-            Doc::Concat(_, forced) | Doc::Indent(_, _, forced) | Doc::Group(_, forced) => *forced,
+            Doc::Concat(_, forced)
+            | Doc::Indent(_, _, forced)
+            | Doc::Group(_, forced)
+            | Doc::TaggedGroup(_, _, forced)
+            | Doc::IndentIf(_, _, _, forced) => *forced,
         }
     }
 }
@@ -64,6 +77,16 @@ pub(crate) fn indent(columns: u16, doc: Doc) -> Doc {
 pub(crate) fn group(doc: Doc) -> Doc {
     let forced = doc.forces_break();
     Doc::Group(Box::new(doc), forced)
+}
+
+pub(crate) fn tagged_group(tag: Tag, doc: Doc) -> Doc {
+    let forced = doc.forces_break();
+    Doc::TaggedGroup(tag, Box::new(doc), forced)
+}
+
+pub(crate) fn indent_if(tag: Tag, columns: u16, doc: Doc) -> Doc {
+    let forced = doc.forces_break();
+    Doc::IndentIf(tag, columns, Box::new(doc), forced)
 }
 
 /// `items` separated by `separator` followed by a `Line`.

@@ -1,34 +1,42 @@
 //! Turns a [`Doc`] into text, choosing which groups to break.
 
-use crate::doc::Doc;
+use std::collections::HashSet;
+
+use crate::doc::{Doc, Tag};
 
 /// Line breaks are not written when requested but held until the next text
-/// arrives. That makes `HardLine` and `BlankLine` idempotent, lets the next
-/// text's own indentation apply, and means lines never end in whitespace.
+/// arrives. That makes `HardLine` and `BlankLine` idempotent and means lines
+/// never end in whitespace. The new line is indented as the most recent line
+/// break asked, not as the text that follows it: the text may sit in an
+/// indented document of its own that only concerns its later lines.
 struct Output {
     text: String,
     column: usize,
     /// Line breaks owed before the next text: 0, 1, or 2 (a blank line).
     pending: u8,
+    /// Indentation of the line the next text starts, if `pending > 0`.
+    pending_indent: usize,
 }
 
 impl Output {
-    fn newline(&mut self, count: u8) {
+    fn newline(&mut self, count: u8, indent: usize) {
         // Nothing has been printed yet: files do not start with blank lines.
         if !self.text.is_empty() {
             self.pending = self.pending.max(count);
+            self.pending_indent = indent;
         }
     }
 
     /// Writes a space, unless the next text will start a line.
-    fn space(&mut self, indent: usize) {
+    fn space(&mut self) {
         if self.pending == 0 && !self.text.is_empty() {
-            self.write(" ", indent);
+            self.write(" ");
         }
     }
 
-    fn write(&mut self, text: &str, indent: usize) {
+    fn write(&mut self, text: &str) {
         if self.pending > 0 {
+            let indent = self.pending_indent;
             let trimmed = self.text.trim_end_matches([' ', '\t']).len();
             self.text.truncate(trimmed);
             for _ in 0..self.pending {
@@ -57,28 +65,50 @@ pub(crate) fn print(doc: &Doc, line_width: usize) -> String {
         text: String::new(),
         column: 0,
         pending: 0,
+        pending_indent: 0,
     };
     // (indentation, printed flat?, document), last entry printed first.
     let mut stack: Vec<(usize, bool, &Doc)> = vec![(0, false, doc)];
+    // Tagged groups that were broken.
+    let mut broken: HashSet<Tag> = HashSet::new();
 
     while let Some((indent, flat, doc)) = stack.pop() {
+        let whole = doc;
         match doc {
-            Doc::Text(text) | Doc::Suffix(text) => out.write(text, indent),
-            Doc::Space => out.space(indent),
-            Doc::Line if flat => out.space(indent),
+            Doc::Text(text) | Doc::Suffix(text) => out.write(text),
+            Doc::Space => out.space(),
+            // A line break that a comment already forced takes the place of
+            // this one, at this one's indentation.
+            Doc::Line | Doc::SoftLine if flat && out.pending > 0 => out.pending_indent = indent,
+            Doc::Line if flat => out.space(),
             Doc::SoftLine if flat => {}
-            Doc::Line | Doc::SoftLine | Doc::HardLine => out.newline(1),
-            Doc::BlankLine => out.newline(2),
+            Doc::Line | Doc::SoftLine | Doc::HardLine => out.newline(1, indent),
+            Doc::BlankLine => out.newline(2, indent),
             Doc::Concat(docs, _) => {
                 stack.extend(docs.iter().rev().map(|doc| (indent, flat, doc)));
             }
             Doc::Indent(columns, doc, _) => stack.push((indent + *columns as usize, flat, doc)),
-            Doc::Group(doc, forced) => {
+            Doc::IndentIf(tag, columns, doc, _) => {
+                let extra = if broken.contains(tag) {
+                    *columns as usize
+                } else {
+                    0
+                };
+                stack.push((indent + extra, flat, doc));
+            }
+            Doc::Group(doc, forced) | Doc::TaggedGroup(_, doc, forced) => {
                 let flat = flat
                     || (!forced && {
-                        let column = if out.pending > 0 { indent } else { out.column };
+                        let column = if out.pending > 0 {
+                            out.pending_indent
+                        } else {
+                            out.column
+                        };
                         fits(doc, &stack, line_width as isize - column as isize)
                     });
+                if let (false, Doc::TaggedGroup(tag, ..)) = (flat, whole) {
+                    broken.insert(*tag);
+                }
                 stack.push((indent, flat, doc));
             }
         }
@@ -118,8 +148,10 @@ fn fits(doc: &Doc, rest: &[(usize, bool, &Doc)], mut remaining: isize) -> bool {
             // A line break ends the line: everything measured so far fits.
             Doc::Line | Doc::SoftLine | Doc::HardLine | Doc::BlankLine => return true,
             Doc::Concat(docs, _) => stack.extend(docs.iter().rev().map(|doc| (flat, doc))),
-            Doc::Indent(_, doc, _) => stack.push((flat, doc)),
-            Doc::Group(doc, forced) => stack.push((flat && !forced, doc)),
+            Doc::Indent(_, doc, _) | Doc::IndentIf(_, _, doc, _) => stack.push((flat, doc)),
+            Doc::Group(doc, forced) | Doc::TaggedGroup(_, doc, forced) => {
+                stack.push((flat && !forced, doc))
+            }
         }
         if remaining < 0 {
             return false;
