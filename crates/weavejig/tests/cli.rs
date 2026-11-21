@@ -180,6 +180,37 @@ fn format_rewrites_files_and_check_mode_does_not() {
 }
 
 #[test]
+fn an_unreadable_file_does_not_stop_the_others() {
+    let dir = project(
+        "unreadable",
+        &[("A.java", "class A{int x;}\n"), ("C.java", UNTIDY)],
+    );
+    // Latin-1, not UTF-8.
+    fs::write(dir.join("B.java"), b"class B { // caf\xe9\n}\n").unwrap();
+
+    let output = weavejig(&dir, &["format"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("cannot read B.java"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        stdout(&output),
+        "2 files reformatted, 0 unchanged, 1 could not be formatted.\n"
+    );
+
+    let output = weavejig(&dir, &["check"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("cannot read B.java"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains("C.java:"), "{}", stdout(&output));
+}
+
+#[test]
 fn stdin() {
     let dir = project("stdin", &[]);
     let output = weavejig_stdin(&dir, &["format", "-"], "class A{int x;}");

@@ -189,6 +189,9 @@ fn check_source(file: &str, text: &str, rules: &RuleSet, fix: bool) -> (Checked,
 fn check(args: CheckArgs, loaded: &config::Loaded) -> Result<u8> {
     let rules = loaded.config.rules(&args.select, &args.ignore)?;
 
+    // Files that could not be read or written. Each is reported and the
+    // rest are still checked, so one bad file does not hide the others.
+    let mut failed = 0;
     let results: Vec<Checked> = if is_stdin(&args.paths) {
         let text = read_stdin()?;
         let (checked, fixed_text) = check_source("<stdin>", &text, &rules, args.fix);
@@ -207,7 +210,7 @@ fn check(args: CheckArgs, loaded: &config::Loaded) -> Result<u8> {
         vec![checked]
     } else {
         let files = files::discover(&args.paths, &loaded.root, &loaded.config.exclude)?;
-        files
+        let outcomes: Vec<Result<Checked>> = files
             .par_iter()
             .map(|path| {
                 let text = read_source(path)?;
@@ -219,11 +222,26 @@ fn check(args: CheckArgs, loaded: &config::Loaded) -> Result<u8> {
                 }
                 Ok(checked)
             })
-            .collect::<Result<_>>()?
+            .collect();
+        let mut results = Vec::with_capacity(outcomes.len());
+        for outcome in outcomes {
+            match outcome {
+                Ok(checked) => results.push(checked),
+                Err(error) => {
+                    failed += 1;
+                    eprintln!("error: {error:#}");
+                }
+            }
+        }
+        results
     };
 
     let report = report(results);
     print!("{}", render(&report, args.output_format)?);
+    if failed > 0 {
+        eprintln!("{} could not be checked.", count(failed, "file"));
+        return Ok(EXIT_ERROR);
+    }
     Ok(if report.summary.diagnostics > 0 {
         EXIT_FINDINGS
     } else {
@@ -326,10 +344,16 @@ fn format_command(args: FormatArgs, loaded: &config::Loaded) -> Result<u8> {
     }
 
     let files = files::discover(&args.paths, &loaded.root, &loaded.config.exclude)?;
+    // A file that cannot be read or written fails on its own; the others
+    // are still formatted and reported.
     let results: Vec<(&PathBuf, Formatted)> = files
         .par_iter()
-        .map(|path| Ok((path, format_file(path, &options, !args.check)?)))
-        .collect::<Result<_>>()?;
+        .map(|path| {
+            let result = format_file(path, &options, !args.check)
+                .unwrap_or_else(|error| Formatted::Failed(format!("error: {error:#}")));
+            (path, result)
+        })
+        .collect();
 
     let (mut changed, mut unchanged, mut failed) = (0, 0, 0);
     for (path, result) in &results {
