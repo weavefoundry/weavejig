@@ -107,17 +107,29 @@ fn comment_doc(comment: &Comment, trailing: bool) -> Doc {
     if lines.len() < 2 {
         return text(comment.text.clone());
     }
-    // Later lines line up with the comment's start: under the `/` if they
-    // are plain text, one column in if they start with `*`.
+    let rest = &lines[1..];
     let mut docs = vec![text(lines[0].trim_end())];
-    for line in &lines[1..] {
-        let line = line.trim();
-        docs.push(Doc::HardLine);
-        docs.push(text(if line.starts_with('*') {
-            format!(" {line}")
-        } else {
-            line.to_string()
-        }));
+    // As google-java-format does: if every later line starts with `*`, they
+    // line up one column in from the comment's start. Otherwise the comment
+    // keeps its shape: later lines lose only the indentation they all share,
+    // so commented-out code and diagrams stay intact.
+    if rest.iter().all(|line| line.trim_start().starts_with('*')) {
+        for line in rest {
+            docs.push(Doc::HardLine);
+            docs.push(text(format!(" {}", line.trim())));
+        }
+    } else {
+        let shared = rest
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.len() - line.trim_start().len())
+            .min()
+            .unwrap_or(0);
+        for line in rest {
+            docs.push(Doc::HardLine);
+            let line = line.trim_end();
+            docs.push(text(line.get(shared..).unwrap_or(line.trim_start())));
+        }
     }
     concat(docs)
 }

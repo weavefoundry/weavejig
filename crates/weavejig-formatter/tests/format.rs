@@ -308,3 +308,63 @@ fn comment_above_a_statement_does_not_wrap_it() {
         "a();\n// why\nassertThat(a).isEqualTo(b);\n/* also */\nx = y;"
     );
 }
+
+#[test]
+fn block_comments_keep_their_shape() {
+    // Commented-out code keeps its relative indentation, and later lines
+    // that all start with `*` line up one column in.
+    let expected = "\
+class C {
+  void m() {
+    /*
+        if (x) {
+            foo();
+        }
+    */
+    g();
+    /* one
+     * two
+     */
+    h();
+  }
+}
+";
+    let input = "\
+class C {
+void m() {
+      /*
+          if (x) {
+              foo();
+          }
+      */
+    g();
+  /* one
+         * two
+   */
+    h();
+  }
+}
+";
+    assert_eq!(fmt(input), expected);
+    assert_eq!(fmt(expected), expected);
+}
+
+#[test]
+fn long_line_comments_with_wide_characters_wrap() {
+    // Each `n` puts a different character at the wrap column; one of them
+    // used to slice a two-byte `é` in half and panic.
+    for n in 85..96 {
+        let comment = format!("// {} {}", "a".repeat(n), "é".repeat(30));
+        let formatted = fmt(&format!(
+            "class C {{\n  void m() {{\n    {comment}\n    g();\n  }}\n}}\n"
+        ));
+        // Past 93, the run of `a` alone overflows: no space to break at.
+        if n <= 93 {
+            assert!(
+                formatted.contains(&format!("    // {}\n", "é".repeat(30))),
+                "{formatted}"
+            );
+        }
+        assert_eq!(fmt(&formatted), formatted);
+    }
+}

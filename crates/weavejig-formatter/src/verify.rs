@@ -37,6 +37,11 @@ fn fingerprint(text: &str) -> Fingerprint {
             // `import` is a reserved word: it only ever starts an import.
             SyntaxKind::IMPORT_KW => import = Some(String::new()),
             SyntaxKind::SEMI if import.is_some() => fingerprint.imports.extend(import.take()),
+            // The compiler reads every line terminator in a text block as
+            // `\n` (JLS §3.10.6), so the file's line endings may change them.
+            SyntaxKind::TEXT_BLOCK if import.is_none() => fingerprint
+                .tokens
+                .push(token_text.replace("\r\n", "\n").replace('\r', "\n")),
             _ => match &mut import {
                 Some(import) => {
                     import.push_str(token_text);

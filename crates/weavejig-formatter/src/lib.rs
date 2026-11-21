@@ -92,6 +92,71 @@ pub fn format(text: &str, options: &FormatOptions) -> Result<String, FormatError
     let root = parse.syntax();
     let doc = format::Formatter::new(&root, options).node(&root);
     let formatted = printer::print(&doc, FormatOptions::LINE_WIDTH);
+    let formatted = with_line_separator(&formatted, line_separator(text));
     verify::check(text, &formatted).map_err(FormatError::Internal)?;
     Ok(formatted)
+}
+
+/// The line separator to write, which is the first one in `text`, as
+/// google-java-format chooses it.
+fn line_separator(text: &str) -> &'static str {
+    match text.find(['\r', '\n']) {
+        Some(i) if text[i..].starts_with("\r\n") => "\r\n",
+        Some(i) if text.as_bytes()[i] == b'\r' => "\r",
+        _ => "\n",
+    }
+}
+
+/// `text` with every line terminator replaced by `separator`. This covers
+/// the printer's own line breaks and those inside text blocks and comments,
+/// so a file never ends up with mixed line endings.
+fn with_line_separator(text: &str, separator: &str) -> String {
+    if separator == "\n" && !text.contains('\r') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + text.len() / 32);
+    let mut rest = text;
+    while let Some(i) = rest.find(['\r', '\n']) {
+        out.push_str(&rest[..i]);
+        out.push_str(separator);
+        let len = if rest[i..].starts_with("\r\n") { 2 } else { 1 };
+        rest = &rest[i + len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_endings_follow_the_input() {
+        let options = FormatOptions::default();
+        assert_eq!(
+            format("class A{int x;}\r\n", &options).unwrap(),
+            "class A {\r\n  int x;\r\n}\r\n"
+        );
+        assert_eq!(
+            format("class A{int x;}\r", &options).unwrap(),
+            "class A {\r  int x;\r}\r"
+        );
+        assert_eq!(
+            format("class A{int x;}\n", &options).unwrap(),
+            "class A {\n  int x;\n}\n"
+        );
+        // Text blocks and block comments follow the file, too: a CRLF file
+        // formats exactly as its LF twin does, with CRLF everywhere, even
+        // when a text block inside it used LF.
+        let lf = "class A {\n  /* a\n     b */\n  String s = \"\"\"\n      x\n      \"\"\";\n}\n";
+        let expected = format(lf, &options).unwrap().replace('\n', "\r\n");
+        assert_eq!(
+            format(&lf.replace('\n', "\r\n"), &options).unwrap(),
+            expected
+        );
+        let mixed = lf
+            .replace('\n', "\r\n")
+            .replace("\"\"\"\r\n      x\r\n", "\"\"\"\n      x\n");
+        assert_eq!(format(&mixed, &options).unwrap(), expected);
+    }
 }

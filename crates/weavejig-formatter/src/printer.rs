@@ -200,12 +200,14 @@ fn wrap_comment(comment: &str, available: usize) -> Vec<String> {
     let mut rest = comment.to_string();
     while width(&rest) > available {
         // The last space that leaves the first part within the limit, not
-        // counting the one right after `//`.
-        let limit = rest
+        // counting the one right after `//`. A space just past the limit
+        // still qualifies: the part before it fits exactly. The end is a
+        // byte offset, so it must take in the whole character there.
+        let end = rest
             .char_indices()
             .nth(available)
-            .map_or(rest.len(), |(index, _)| index);
-        let Some(split) = rest[..=limit.min(rest.len() - 1)]
+            .map_or(rest.len(), |(index, c)| index + c.len_utf8());
+        let Some(split) = rest[..end]
             .rfind(' ')
             .filter(|&split| split > 2 && !rest[..split].trim_start_matches('/').trim().is_empty())
         else {
@@ -392,6 +394,18 @@ mod tests {
         );
         assert_eq!(print(&doc, 12), "{\n  // one two\n  // three\n");
         assert_eq!(print(&doc, 80), "{\n  // one two three\n");
+    }
+
+    #[test]
+    fn wrapping_counts_characters_not_bytes() {
+        // A multi-byte character sits exactly at the wrap limit.
+        for n in 5..12 {
+            let comment = format!("// {} {}", "a".repeat(n), "é".repeat(10));
+            for line in wrap_comment(&comment, 12) {
+                assert!(line.starts_with("//"), "{line:?}");
+            }
+        }
+        assert_eq!(wrap_comment("// ééé ééé ééé", 10), ["// ééé ééé", "// ééé"]);
     }
 
     #[test]
