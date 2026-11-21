@@ -39,11 +39,11 @@ Early development. Everything below runs, but nothing is at parity yet: do not r
 
 | Part | What exists |
 |---|---|
-| Parser | Hand-written, lossless, error-tolerant, written for the Java 21 grammar. Agrees with `javac` on all 4,179 files of the dev corpus. |
-| Formatter | Formats whole files in google-java-format style, Javadoc included. 97.0% of dev-corpus files (4,055 of 4,179) come out identical to google-java-format 2.0.0. Not done: long string literals are not re-split, unused imports are not removed, modifiers are not reordered, and a tail of rarer wrapping cases differs. |
-| Linter | Six Checkstyle rules, five with fixes. No PMD rules. |
+| Parser | Hand-written, lossless, error-tolerant, written for the Java 21 grammar. Agrees with `javac` on all 4,179 files of the dev corpus and on 2,548 of 2,549 held-out files. |
+| Formatter | Formats whole files in google-java-format style, Javadoc included. 97.0% of dev-corpus files (4,055 of 4,179) come out identical to google-java-format 2.0.0, and 76.3% of held-out files (1,946 of 2,549): the rules were tuned on the dev corpus. Not done: long string literals are not re-split, unused imports are not removed, modifiers are not reordered, and a tail of rarer wrapping cases differs. |
+| Linter | Six Checkstyle rules, five with fixes. Their diagnostics match Checkstyle on 78 of 80 in the dev corpus and all 1,083 in the held-out corpus. No PMD rules. |
 | CLI | `check`, `format`, `rules`; text and JSON output; `weavejig.toml`. |
-| Scoring | `cargo xtask score` for the parser (`javac`), formatter (google-java-format) and linter (Checkstyle). PMD is not wired up, and the held-out corpus has not been scored yet. |
+| Scoring | `cargo xtask score` for the parser (`javac`), formatter (google-java-format) and linter (Checkstyle). PMD is not wired up. |
 
 The formatter never changes anything but whitespace, import order and the wrapping of comments: it checks its own output against the input, and refuses to write a file if any token would differ or any comment would gain or lose text.
 
