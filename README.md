@@ -133,7 +133,7 @@ Lines and columns are 1-based; columns count Unicode code points. `offset` is a 
 
 ## Development
 
-Requires Rust 1.85 or newer. Scoring also needs JDK 21 or newer.
+Requires Rust 1.88 or newer. Scoring also needs JDK 21 or newer.
 
 ```bash
 cargo test --workspace
