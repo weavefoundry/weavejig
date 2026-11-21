@@ -5,7 +5,7 @@
 //! children out on one line using the spacing table. A rule exists wherever
 //! a construct needs line breaks or indentation.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
 use weavejig_syntax::{
@@ -16,7 +16,8 @@ use weavejig_syntax::{
 use crate::FormatOptions;
 use crate::comments::{Comment, Comments, TokenTrivia};
 use crate::doc::{
-    Doc, Tag, concat, fill_break, group, group_if, indent, indent_if, space, tagged_group, text,
+    Doc, Tag, concat, fill_break, group, group_if, indent, indent_if, next_line_if_fits, space,
+    tagged_group, text,
 };
 use crate::spacing::space_between;
 
@@ -29,6 +30,9 @@ pub(crate) struct Formatter<'a> {
     /// rather than declarations, such as JSpecify's `@Nullable`.
     type_annotations: HashSet<String>,
     next_tag: Cell<Tag>,
+    /// Argument lists, by start offset, whose only argument is not laid out
+    /// the special way a lone lambda usually is.
+    plain_lists: RefCell<HashSet<TextSize>>,
 }
 
 /// Annotations that google-java-format keeps next to the type they annotate
@@ -76,9 +80,22 @@ fn last_of(element: &SyntaxElement) -> Option<SyntaxToken> {
 
 fn comment_doc(comment: &Comment, trailing: bool) -> Doc {
     if comment.is_line {
-        let line = comment.text.trim_end().to_string();
+        let mut line = comment.text.trim_end().to_string();
+        // `//comment` gets a space after the slashes, except in the two
+        // forms tools read: `//noinspection` and `//$NON-NLS-1$`.
+        let slashes = line.len() - line.trim_start_matches('/').len();
+        let body = &line[slashes..];
+        if !body.is_empty()
+            && !body.starts_with(char::is_whitespace)
+            && !body.starts_with("noinspection")
+            && !is_non_nls_marker(body)
+        {
+            line.insert(slashes, ' ');
+        }
         return if trailing {
             Doc::Suffix(line)
+        } else if comment.newlines_before > 0 {
+            Doc::LineComment(line)
         } else {
             text(line)
         };
@@ -124,6 +141,7 @@ impl<'a> Formatter<'a> {
             skip_leading: Cell::new(None),
             type_annotations,
             next_tag: Cell::new(0),
+            plain_lists: RefCell::new(HashSet::new()),
         }
     }
 
@@ -211,9 +229,9 @@ impl<'a> Formatter<'a> {
                 if newlines_after == 0 {
                     docs.push(space());
                 }
-            } else if newlines_after >= 2 {
+            } else if newlines_after >= 2 && !(comment.is_javadoc() && before.is_some()) {
                 docs.push(Doc::BlankLine);
-            } else if newlines_after == 1 || comment.is_line {
+            } else if newlines_after >= 1 || comment.is_line {
                 docs.push(Doc::HardLine);
             } else if !matches!(before, Some(COMMA | SEMI | R_PAREN | R_BRACK)) {
                 docs.push(space());
@@ -230,6 +248,12 @@ impl<'a> Formatter<'a> {
         let blank = trivia.blank_line_before() && !docs.is_empty();
         docs.push(if blank { Doc::BlankLine } else { Doc::HardLine });
         self.leading_comments(trivia, None, docs);
+    }
+
+    fn has_leading_comments(&self, node: &SyntaxNode) -> bool {
+        first_token(node)
+            .and_then(|first| self.trivia(&first).map(|t| !t.leading.is_empty()))
+            .unwrap_or(false)
     }
 
     fn has_dangling_comments(&self, close: &SyntaxToken) -> bool {
@@ -865,8 +889,9 @@ impl<'a> Formatter<'a> {
             // may be packed together or spaced out as the author chose;
             // everything else gets a blank line.
             let separator = match previous.as_ref().map(|p| (p.kind(), p)) {
-                // A blank line before the first enum constant is dropped.
-                None if in_enum => Doc::HardLine,
+                // A blank line before the first enum constant is dropped,
+                // unless a comment comes first.
+                None if in_enum && !self.has_leading_comments(member) => Doc::HardLine,
                 None => self.separator(member),
                 Some((ENUM_CONSTANT, _)) if member.kind() == ENUM_CONSTANT => {
                     self.separator(member)
@@ -969,11 +994,26 @@ impl<'a> Formatter<'a> {
             }
             body.push(self.with_comments(statement));
         }
+        // A blank line before the `}` is dropped, unless the statement goes
+        // on after it: `} else {`, `} catch`, `} while (...)`.
+        let continues = !self.has_dangling_comments(close)
+            && self.blank_line_before(close)
+            && weavejig_syntax::next_significant_token(close).is_some_and(|next| {
+                match next.kind() {
+                    ELSE_KW | CATCH_KW | FINALLY_KW => true,
+                    WHILE_KW => node.parent().is_some_and(|parent| parent.kind() == DO_STMT),
+                    _ => false,
+                }
+            });
         self.dangling_comments(close, &mut body);
         Some(concat(vec![
             self.token(open),
             indent(self.block_indent(), concat(body)),
-            Doc::HardLine,
+            if continues {
+                Doc::BlankLine
+            } else {
+                Doc::HardLine
+            },
             self.token_without_leading(close),
         ]))
     }
@@ -1252,20 +1292,20 @@ impl<'a> Formatter<'a> {
         // Each link is `.name` or `.name(args)`, innermost receiver last.
         let mut links: Vec<Vec<SyntaxElement>> = Vec::new();
         let mut current = node.clone();
-        let (base, base_node) = loop {
+        let (base_elements, base_node) = loop {
             let elements: Vec<SyntaxElement> = significant_children(&current).collect();
             let receiver = match (elements.first(), elements.get(1)) {
                 (Some(NodeOrToken::Node(receiver)), Some(dot)) if dot.kind() == DOT => {
                     receiver.clone()
                 }
                 // A call without a receiver, such as `f(x)`.
-                _ => break (self.spaced(&elements), None),
+                _ => break (elements, None),
             };
             links.push(elements[1..].to_vec());
             if matches!(receiver.kind(), METHOD_CALL | FIELD_ACCESS) {
                 current = receiver;
             } else {
-                break (self.node(&receiver), Some(receiver));
+                break (vec![NodeOrToken::Node(receiver.clone())], Some(receiver));
             }
         };
         links.reverse();
@@ -1316,11 +1356,33 @@ impl<'a> Formatter<'a> {
             _ => attached,
         };
 
-        let mut head = vec![base];
-        head.extend(links[..attached].iter().map(|link| self.spaced(link)));
+        // In the head of a chain that goes on, a block lambda is an ordinary
+        // argument: `new Thread(() -> {` is not left hanging before `.start()`.
         let rest = &links[attached..];
+        if !rest.is_empty() {
+            let mut plain = self.plain_lists.borrow_mut();
+            let base_children = base_node
+                .iter()
+                .flat_map(|base| base.children_with_tokens());
+            for element in base_elements
+                .iter()
+                .cloned()
+                .chain(base_children)
+                .chain(links[..attached].iter().flatten().cloned())
+            {
+                if element.kind() == ARG_LIST {
+                    plain.insert(element.text_range().start());
+                }
+            }
+        }
+        let mut head = vec![self.spaced(&base_elements)];
+        head.extend(links[..attached].iter().map(|link| self.spaced(link)));
         let calls = links.iter().filter(|link| is_call(link)).count();
-        let simple_base = matches!(base_kind, Some(NAME_EXPR | THIS_EXPR | SUPER_EXPR));
+        // What an array access is made of is laid out on its own.
+        let simple_base = matches!(
+            base_kind,
+            Some(NAME_EXPR | THIS_EXPR | SUPER_EXPR | ARRAY_ACCESS)
+        );
         let lone_call = simple_base && calls == 1 && links.last().is_some_and(is_call);
         if rest.is_empty() || (calls == 0 && rest.len() < 2) {
             head.extend(rest.iter().map(|link| self.spaced(link)));
@@ -1439,11 +1501,30 @@ impl<'a> Formatter<'a> {
         if let [NodeOrToken::Node(only)] = items
             && only.kind() == LAMBDA_EXPR
         {
-            return Some(concat(vec![
-                self.element(open),
-                self.node(only),
-                self.element(close),
-            ]));
+            let block = only
+                .children()
+                .last()
+                .is_some_and(|body| body.kind() == BLOCK);
+            let plain = self
+                .plain_lists
+                .borrow()
+                .contains(&node.text_range().start());
+            if !block {
+                // `f(() -> value)`, or the lambda on the next line if it
+                // fits there, or `f(() ->` with the value below.
+                return Some(concat(vec![
+                    self.element(open),
+                    next_line_if_fits(continuation, self.node(only)),
+                    self.element(close),
+                ]));
+            }
+            if !plain {
+                return Some(concat(vec![
+                    self.element(open),
+                    self.node(only),
+                    self.element(close),
+                ]));
+            }
         }
         let arguments: Vec<&[SyntaxElement]> =
             items.split_inclusive(|el| el.kind() == COMMA).collect();
@@ -1616,6 +1697,13 @@ fn is_format_string(argument: &[SyntaxElement]) -> bool {
                 .skip(1)
                 .any(|rest| rest.starts_with(|c: char| c.is_ascii_alphanumeric()))
         })
+}
+
+/// Whether a comment's text is exactly `$NON-NLS-1$`, with any number.
+fn is_non_nls_marker(body: &str) -> bool {
+    body.strip_prefix("$NON-NLS-")
+        .and_then(|rest| rest.strip_suffix('$'))
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Whether an identifier looks like a class name: `Foo` or `T`, but not

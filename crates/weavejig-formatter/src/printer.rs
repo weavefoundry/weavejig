@@ -96,6 +96,38 @@ pub(crate) fn print(doc: &Doc, line_width: usize) -> String {
                 };
                 stack.push((indent + extra, flat, doc));
             }
+            Doc::LineComment(comment) => {
+                let column = if out.pending > 0 {
+                    out.pending_indent
+                } else {
+                    out.column
+                };
+                for (i, line) in wrap_comment(comment, line_width.saturating_sub(column))
+                    .iter()
+                    .enumerate()
+                {
+                    if i > 0 {
+                        out.newline(1, column);
+                    }
+                    out.write(line);
+                }
+            }
+            Doc::NextLineIfFits(columns, doc, forced) => {
+                let column = if out.pending > 0 {
+                    out.pending_indent
+                } else {
+                    out.column
+                };
+                let next = indent + *columns as usize;
+                if flat || (!forced && fits(doc, &stack, line_width as isize - column as isize)) {
+                    stack.push((indent, true, doc));
+                } else if !forced && fits(doc, &stack, line_width as isize - next as isize) {
+                    out.newline(1, next);
+                    stack.push((next, true, doc));
+                } else {
+                    stack.push((indent, false, doc));
+                }
+            }
             Doc::FillBreak(doc, _) => {
                 let fits_here = flat
                     || (out.pending == 0
@@ -145,6 +177,33 @@ pub(crate) fn print(doc: &Doc, line_width: usize) -> String {
     out.text
 }
 
+/// Splits a `//` comment that is wider than `available` columns into several,
+/// breaking at spaces. A comment without a usable space is left alone.
+fn wrap_comment(comment: &str, available: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut rest = comment.to_string();
+    while width(&rest) > available {
+        // The last space that leaves the first part within the limit, not
+        // counting the one right after `//`.
+        let limit = rest
+            .char_indices()
+            .nth(available)
+            .map_or(rest.len(), |(index, _)| index);
+        let Some(split) = rest[..=limit.min(rest.len() - 1)]
+            .rfind(' ')
+            .filter(|&split| split > 2 && !rest[..split].trim_start_matches('/').trim().is_empty())
+        else {
+            break;
+        };
+        let tail = rest[split..].trim_start().to_string();
+        rest.truncate(split);
+        lines.push(rest.trim_end().to_string());
+        rest = format!("// {tail}");
+    }
+    lines.push(rest);
+    lines
+}
+
 /// Whether `doc`, printed flat, fits in `remaining` columns together with
 /// whatever follows it on the same line. `rest` is the printer's stack: the
 /// documents still to come, each in the mode already chosen for it.
@@ -164,7 +223,8 @@ fn fits(doc: &Doc, rest: &[(usize, bool, &Doc)], mut remaining: isize) -> bool {
                 Some(newline) => return remaining >= width(&text[..newline]) as isize,
                 None => remaining -= width(text) as isize,
             },
-            Doc::Suffix(_) => {}
+            // A trailing comment counts: code wraps to make room for it.
+            Doc::Suffix(text) | Doc::LineComment(text) => remaining -= width(text) as isize,
             Doc::Space => remaining -= 1,
             Doc::Line if flat => remaining -= 1,
             Doc::SoftLine if flat => {}
@@ -181,6 +241,8 @@ fn fits(doc: &Doc, rest: &[(usize, bool, &Doc)], mut remaining: isize) -> bool {
             }
             // The next item of a fill starts a new line if need be.
             Doc::FillBreak(..) => return true,
+            Doc::NextLineIfFits(_, doc, _) if flat => stack.push((flat, doc)),
+            Doc::NextLineIfFits(..) => return true,
         }
         if remaining < 0 {
             return false;
@@ -265,14 +327,55 @@ mod tests {
     }
 
     #[test]
-    fn suffixes_take_no_room() {
+    fn trailing_comments_take_room() {
+        // google-java-format wraps code to make a trailing comment fit.
         let doc = concat(vec![
             group(concat(vec![text("aaaa"), Doc::Line, text("bbbb")])),
-            Doc::Suffix(" // a long trailing comment".to_string()),
+            Doc::Suffix(" // long".to_string()),
             Doc::HardLine,
             text("c"),
         ]);
-        assert_eq!(print(&doc, 10), "aaaa bbbb // a long trailing comment\nc\n");
+        assert_eq!(print(&doc, 17), "aaaa bbbb // long\nc\n");
+        assert_eq!(print(&doc, 16), "aaaa\nbbbb // long\nc\n");
+    }
+
+    #[test]
+    fn fill_breaks_only_where_needed() {
+        let items = ["aa,", "bb,", "cc,", "dd"];
+        let mut docs = vec![text(items[0])];
+        docs.extend(items[1..].iter().map(|item| fill_break(text(*item))));
+        let doc = group(concat(docs));
+        assert_eq!(print(&doc, 14), "aa, bb, cc, dd\n");
+        assert_eq!(print(&doc, 8), "aa, bb,\ncc, dd\n");
+    }
+
+    #[test]
+    fn conditional_indent_follows_its_group() {
+        let doc = |width| {
+            print(
+                &concat(vec![
+                    tagged_group(7, concat(vec![text("aaaa"), Doc::Line, text("bbbb")])),
+                    indent_if(7, 2, concat(vec![Doc::HardLine, text("c")])),
+                ]),
+                width,
+            )
+        };
+        assert_eq!(doc(9), "aaaa bbbb\nc\n");
+        assert_eq!(doc(8), "aaaa\nbbbb\n  c\n");
+    }
+
+    #[test]
+    fn long_line_comments_are_wrapped() {
+        let doc = indent(
+            2,
+            concat(vec![
+                text("{"),
+                Doc::HardLine,
+                Doc::LineComment("// one two three".to_string()),
+            ]),
+        );
+        assert_eq!(print(&doc, 12), "{\n  // one two\n  // three\n");
+        assert_eq!(print(&doc, 80), "{\n  // one two three\n");
     }
 
     #[test]

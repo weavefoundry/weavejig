@@ -8,8 +8,8 @@
 #[derive(Debug, Clone)]
 pub(crate) enum Doc {
     Text(String),
-    /// Text that takes no room when measuring whether a group fits. Used for
-    /// trailing line comments, which never cause code to be re-wrapped.
+    /// A trailing line comment. It counts when measuring whether a group
+    /// fits: code is wrapped to make room for the comment after it.
     Suffix(String),
     /// A space, unless it would start a line.
     Space,
@@ -42,6 +42,15 @@ pub(crate) enum Doc {
     /// on the current line. A run of these fills lines with as many items
     /// as fit, as in a list of numbers.
     FillBreak(Box<Doc>, bool),
+    /// A document that may start on the next line, indented by a number of
+    /// columns. It stays where it is if it fits there flat; failing that it
+    /// moves to the next line if it fits there flat; failing that it stays
+    /// and is broken. This is how a lambda that is a call's only argument
+    /// is laid out.
+    NextLineIfFits(u16, Box<Doc>, bool),
+    /// A `//` comment on a line of its own, which is wrapped at the line
+    /// width.
+    LineComment(String),
 }
 
 /// Names a [`Doc::TaggedGroup`].
@@ -61,7 +70,9 @@ impl Doc {
             | Doc::TaggedGroup(_, _, forced)
             | Doc::IndentIf(_, _, _, forced)
             | Doc::GroupIf(_, _, forced)
-            | Doc::FillBreak(_, forced) => *forced,
+            | Doc::FillBreak(_, forced)
+            | Doc::NextLineIfFits(_, _, forced) => *forced,
+            Doc::LineComment(_) => false,
         }
     }
 }
@@ -102,6 +113,11 @@ pub(crate) fn indent_if(tag: Tag, columns: u16, doc: Doc) -> Doc {
 pub(crate) fn group_if(tag: Tag, doc: Doc) -> Doc {
     let forced = doc.forces_break();
     Doc::GroupIf(tag, Box::new(doc), forced)
+}
+
+pub(crate) fn next_line_if_fits(columns: u16, doc: Doc) -> Doc {
+    let forced = doc.forces_break();
+    Doc::NextLineIfFits(columns, Box::new(doc), forced)
 }
 
 pub(crate) fn fill_break(doc: Doc) -> Doc {

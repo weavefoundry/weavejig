@@ -11,8 +11,9 @@ struct Fingerprint {
     /// Import declarations, sorted and without duplicates, since the
     /// formatter reorders and deduplicates them.
     imports: Vec<String>,
-    /// Comments, sorted (they travel with imports), compared line by line
-    /// without indentation (multi-line comments are re-indented).
+    /// The words of all comments, sorted: comments travel with imports, and
+    /// are re-indented and re-wrapped. Comment markers and paragraph tags,
+    /// which wrapping adds and removes, are left out.
     comments: Vec<String>,
 }
 
@@ -31,10 +32,7 @@ fn fingerprint(text: &str) -> Fingerprint {
         offset += len;
         match token.kind {
             SyntaxKind::WHITESPACE => {}
-            kind if kind.is_comment() => {
-                let lines: Vec<&str> = token_text.lines().map(str::trim).collect();
-                fingerprint.comments.push(lines.join("\n"));
-            }
+            kind if kind.is_comment() => comment_words(token_text, &mut fingerprint.comments),
             // `import` is a reserved word: it only ever starts an import.
             SyntaxKind::IMPORT_KW => import = Some(String::new()),
             SyntaxKind::SEMI if import.is_some() => fingerprint.imports.extend(import.take()),
@@ -52,6 +50,28 @@ fn fingerprint(text: &str) -> Fingerprint {
     fingerprint.imports.dedup();
     fingerprint.comments.sort();
     fingerprint
+}
+
+/// Adds the words of a comment to `words`, leaving out what re-wrapping a
+/// comment may add or remove: `//`, `/*`, `*/`, the `*` that starts a line,
+/// and `<p>` tags.
+fn comment_words(comment: &str, words: &mut Vec<String>) {
+    for line in comment.lines() {
+        let mut line = line.trim();
+        if line.starts_with("//") {
+            line = line.trim_start_matches('/');
+        } else if let Some(rest) = line.strip_prefix("/*") {
+            line = rest;
+        }
+        let line = line.strip_suffix("*/").unwrap_or(line);
+        let line = line.trim_start().trim_start_matches('*');
+        let line = line
+            .replace("<p>", " ")
+            .replace("</p>", " ")
+            .replace("<P>", " ")
+            .replace("</P>", " ");
+        words.extend(line.split_whitespace().map(str::to_string));
+    }
 }
 
 /// Checks that `formatted` differs from `original` only in layout. On
