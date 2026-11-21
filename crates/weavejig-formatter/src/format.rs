@@ -185,6 +185,24 @@ impl<'a> Formatter<'a> {
         self.trivia(close).is_some_and(|t| !t.leading.is_empty())
     }
 
+    /// A statement or declaration with the comments in front of it printed
+    /// first, outside the element's own layout. A comment on its own line
+    /// must not make the code after it wrap.
+    fn with_comments(&self, element: &SyntaxElement) -> Doc {
+        let Some(first) = first_of(element) else {
+            return self.element(element);
+        };
+        let Some(trivia) = self.trivia(&first).filter(|t| !t.leading.is_empty()) else {
+            return self.element(element);
+        };
+        let mut docs = Vec::new();
+        self.leading_comments(trivia, Some(first.kind()), &mut docs);
+        let previous = self.skip_leading.replace(Some(first.text_range().start()));
+        docs.push(self.element(element));
+        self.skip_leading.set(previous);
+        concat(docs)
+    }
+
     // --- Generic layout ----------------------------------------------------
 
     fn element(&self, element: &SyntaxElement) -> Doc {
@@ -268,7 +286,7 @@ impl<'a> Formatter<'a> {
                 continue;
             }
             docs.push(Doc::BlankLine);
-            docs.push(self.node(child));
+            docs.push(self.with_comments(&NodeOrToken::Node(child.clone())));
         }
         for comment in &self.comments.at_end {
             docs.push(if comment.newlines_before >= 2 {
@@ -432,7 +450,7 @@ impl<'a> Formatter<'a> {
             } else {
                 Doc::BlankLine
             });
-            body.push(self.node(member));
+            body.push(self.with_comments(&NodeOrToken::Node(member.clone())));
             previous = Some(kind);
         }
         self.dangling_comments(close, &mut body);
@@ -468,7 +486,7 @@ impl<'a> Formatter<'a> {
                 Some(node) if i > 0 => body.push(self.separator(node)),
                 _ => body.push(Doc::HardLine),
             }
-            body.push(self.element(statement));
+            body.push(self.with_comments(statement));
         }
         self.dangling_comments(close, &mut body);
         Some(concat(vec![
@@ -497,7 +515,7 @@ impl<'a> Formatter<'a> {
                     } else {
                         self.separator(statement)
                     });
-                    body.push(self.node(statement));
+                    body.push(self.with_comments(&element));
                 }
                 NodeOrToken::Token(token) => labels.push(self.token(token)),
             }

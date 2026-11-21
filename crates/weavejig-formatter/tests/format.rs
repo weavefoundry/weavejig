@@ -297,3 +297,11 @@ fn annotated_array_brackets_are_set_off() {
         "class C {\n  void m(String @A ... rest, int[] plain) {}\n}\n"
     );
 }
+
+#[test]
+fn comment_above_a_statement_does_not_wrap_it() {
+    assert_eq!(
+        fmt_statements("a();\n// why\nassertThat(a).isEqualTo(b);\n/* also */\nx = y;"),
+        "a();\n// why\nassertThat(a).isEqualTo(b);\n/* also */\nx = y;"
+    );
+}
