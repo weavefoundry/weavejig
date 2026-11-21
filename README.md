@@ -39,13 +39,13 @@ Early development. Everything below runs, but nothing is at parity yet: do not r
 
 | Part | What exists |
 |---|---|
-| Parser | Hand-written, lossless, error-tolerant, written for the Java 21 grammar. Agrees with `javac` on the smoke corpus; not yet measured on real codebases. |
-| Formatter | Formats whole files in google-java-format style. Wrapping of long lines is approximate, Javadoc is not reflowed, unused imports are not removed. |
+| Parser | Hand-written, lossless, error-tolerant, written for the Java 21 grammar. Agrees with `javac` on all 4,179 files of the dev corpus. |
+| Formatter | Formats whole files in google-java-format style, Javadoc included. 97.0% of dev-corpus files (4,055 of 4,179) come out identical to google-java-format 2.0.0. Not done: long string literals are not re-split, unused imports are not removed, modifiers are not reordered, and a tail of rarer wrapping cases differs. |
 | Linter | Six Checkstyle rules, five with fixes. No PMD rules. |
 | CLI | `check`, `format`, `rules`; text and JSON output; `weavejig.toml`. |
-| Scoring | `cargo xtask score` for the parser (`javac`), formatter (google-java-format) and linter (Checkstyle). PMD is not wired up, and the dev and held-out corpora have not been scored yet. |
+| Scoring | `cargo xtask score` for the parser (`javac`), formatter (google-java-format) and linter (Checkstyle). PMD is not wired up, and the held-out corpus has not been scored yet. |
 
-The formatter never changes anything but whitespace and import order: it checks its own output against the input, and refuses to write a file if any token or comment would differ.
+The formatter never changes anything but whitespace, import order and the wrapping of comments: it checks its own output against the input, and refuses to write a file if any token would differ or any comment would gain or lose text.
 
 ## Usage
 
