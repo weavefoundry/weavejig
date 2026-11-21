@@ -294,11 +294,21 @@ impl<'a> Formatter<'a> {
             COMPILATION_UNIT => Some(self.compilation_unit(node)),
             MODULE_DECL => self.module_decl(node),
             MODIFIERS => Some(self.modifiers(node)),
+            CLASS_DECL | INTERFACE_DECL | ENUM_DECL | RECORD_DECL | ANNOTATION_TYPE_DECL => {
+                self.type_decl(node)
+            }
+            METHOD_DECL | CONSTRUCTOR_DECL => self.method_decl(node),
+            FIELD_DECL | LOCAL_VAR_DECL => self.var_decl(node),
+            PARAM => self.param(node),
+            TYPE_ARGS | TYPE_PARAMS => self.angle_list(node),
+            UNION_TYPE => self.union_type(node),
             CLASS_BODY => self.class_body(node),
             BLOCK | SWITCH_BLOCK => self.block(node),
             SWITCH_GROUP => Some(self.switch_group(node)),
             IF_STMT => self.if_stmt(node),
-            WHILE_STMT | FOR_STMT | FOREACH_STMT => self.loop_stmt(node),
+            WHILE_STMT => self.loop_stmt(node),
+            FOR_STMT => self.for_stmt(node),
+            FOREACH_STMT => self.foreach_stmt(node),
             LABELED_STMT => self.labeled_stmt(node),
             RESOURCE_LIST => self.resource_list(node),
             VARIABLE_DECLARATOR | ASSIGN_EXPR | ANNOTATION_PAIR => self.assignment(node),
@@ -490,6 +500,303 @@ impl<'a> Formatter<'a> {
         }
         docs.push(self.spaced(&elements[lines..]));
         concat(docs)
+    }
+
+    /// `class Name<T> extends A implements B, C {`: each clause moves to a
+    /// line of its own if it does not fit where it is, and the types it
+    /// lists then wrap one per line.
+    fn type_decl(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let is_tail = |kind: SyntaxKind| {
+            matches!(
+                kind,
+                TYPE_PARAMS
+                    | PARAM_LIST
+                    | EXTENDS_CLAUSE
+                    | IMPLEMENTS_CLAUSE
+                    | PERMITS_CLAUSE
+                    | CLASS_BODY
+            )
+        };
+        let split = elements.iter().position(|el| is_tail(el.kind()))?;
+        let mut docs = vec![self.spaced(&elements[..split])];
+        // Type parameters and record components, which the first clause is
+        // grouped with: if they wrap, so does it.
+        let mut before_clauses = Vec::new();
+        for element in &elements[split..] {
+            match element {
+                NodeOrToken::Node(clause)
+                    if matches!(
+                        clause.kind(),
+                        EXTENDS_CLAUSE | IMPLEMENTS_CLAUSE | PERMITS_CLAUSE
+                    ) =>
+                {
+                    before_clauses.push(indent(
+                        self.continuation_indent(),
+                        concat(vec![Doc::Line, self.type_list_clause(clause)?]),
+                    ));
+                    docs.push(group(concat(std::mem::take(&mut before_clauses))));
+                }
+                NodeOrToken::Node(body) if body.kind() == CLASS_BODY => {
+                    docs.append(&mut before_clauses);
+                    docs.push(space());
+                    docs.push(self.node(body));
+                }
+                NodeOrToken::Node(node) if is_tail(node.kind()) => {
+                    before_clauses.push(self.node(node));
+                }
+                _ => return None,
+            }
+        }
+        docs.append(&mut before_clauses);
+        Some(concat(docs))
+    }
+
+    /// `extends A, B` or `throws A, B`: a keyword and the types after it,
+    /// which wrap one per line if they do not fit.
+    fn type_list_clause(&self, clause: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(clause).collect();
+        let (keyword, types) = elements.split_first()?;
+        let (first, others) = types.split_first()?;
+        Some(concat(vec![
+            self.element(keyword),
+            space(),
+            group(concat(vec![
+                self.element(first),
+                indent(self.continuation_indent(), self.comma_separated(others)),
+            ])),
+        ]))
+    }
+
+    /// `<A, B>`: type arguments or parameters. If they do not fit they move
+    /// to the next line, and if they still do not fit, to a line each.
+    fn angle_list(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let (open, rest) = elements.split_first()?;
+        let (close, items) = rest.split_last()?;
+        if items.is_empty() {
+            return Some(concat(vec![self.element(open), self.element(close)]));
+        }
+        let parent = node.parent()?;
+        // `this.<T>f()`: the type arguments of a call stay with its name.
+        if matches!(parent.kind(), METHOD_CALL | NEW_EXPR | METHOD_REF)
+            && node.next_sibling_or_token().is_some_and(|next| {
+                std::iter::successors(Some(next), |el| el.next_sibling_or_token())
+                    .find(|el| !el.kind().is_trivia())
+                    .is_some_and(|el| el.kind() == IDENT)
+            })
+        {
+            return None;
+        }
+        // Parameters that are followed by more of the declaration's header
+        // are indented twice, to set them apart from it.
+        let double = node.kind() == TYPE_PARAMS
+            && (matches!(parent.kind(), METHOD_DECL | CONSTRUCTOR_DECL)
+                || parent.children().any(|sibling| {
+                    matches!(
+                        sibling.kind(),
+                        EXTENDS_CLAUSE | IMPLEMENTS_CLAUSE | PERMITS_CLAUSE
+                    )
+                }));
+        let columns = self.continuation_indent() * if double { 2 } else { 1 };
+        Some(concat(vec![
+            self.element(open),
+            group(indent(
+                columns,
+                concat(vec![Doc::SoftLine, group(self.comma_separated(items))]),
+            )),
+            self.element(close),
+        ]))
+    }
+
+    /// A method or constructor header.
+    ///
+    /// Three places may break, each on its own: after the type parameters,
+    /// after the return type, and after `(`. Everything after a break that
+    /// was taken is indented once more. If the header still does not fit,
+    /// `throws` moves to its own line.
+    fn method_decl(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let params = elements.iter().position(|el| el.kind() == PARAM_LIST)?;
+        let name = params.checked_sub(1)?;
+        if elements[name].kind() != IDENT {
+            return None;
+        }
+        let mut before = &elements[..name];
+        let mut docs = Vec::new();
+        if let Some((modifiers, rest)) = before.split_first()
+            && modifiers.kind() == MODIFIERS
+        {
+            docs.push(self.element(modifiers));
+            docs.push(space());
+            before = rest;
+        }
+        let (type_params, return_type) = match before {
+            [] => (None, None),
+            [only] if only.kind() == TYPE_PARAMS => (Some(only), None),
+            [only] => (None, Some(only)),
+            [first, second] if first.kind() == TYPE_PARAMS => (Some(first), Some(second)),
+            _ => return None,
+        };
+
+        let continuation = self.continuation_indent();
+        let mut tail = vec![
+            self.element(&elements[name]),
+            self.element(&elements[params]),
+        ];
+        let mut body = Vec::new();
+        for element in &elements[params + 1..] {
+            match element {
+                NodeOrToken::Token(token) if matches!(token.kind(), L_BRACK | R_BRACK) => {
+                    tail.push(self.token(token));
+                }
+                NodeOrToken::Node(throws) if throws.kind() == THROWS_CLAUSE => {
+                    tail.push(indent(
+                        continuation,
+                        concat(vec![Doc::Line, self.type_list_clause(throws)?]),
+                    ));
+                }
+                NodeOrToken::Token(semi) if semi.kind() == SEMI => body.push(self.token(semi)),
+                NodeOrToken::Node(node) if matches!(node.kind(), BLOCK | DEFAULT_VALUE) => {
+                    body.push(space());
+                    body.push(self.node(node));
+                }
+                _ => return None,
+            }
+        }
+
+        let (after_params, after_type) = (self.tag(), self.tag());
+        let type_group = return_type.map(|return_type| {
+            tagged_group(
+                after_type,
+                concat(vec![
+                    self.element(return_type),
+                    indent(continuation, Doc::Line),
+                ]),
+            )
+        });
+        let tail = indent_if(after_type, continuation, concat(tail));
+        let header = match type_params {
+            Some(type_params) => {
+                let mut inner = vec![Doc::Line];
+                inner.extend(type_group);
+                concat(vec![
+                    tagged_group(
+                        after_params,
+                        concat(vec![
+                            self.element(type_params),
+                            indent(continuation, concat(inner)),
+                        ]),
+                    ),
+                    indent_if(after_params, continuation, tail),
+                ])
+            }
+            None => {
+                let mut header: Vec<Doc> = type_group.into_iter().collect();
+                header.push(tail);
+                concat(header)
+            }
+        };
+        docs.push(group(header));
+        docs.extend(body);
+        Some(concat(docs))
+    }
+
+    /// A field or local variable declaration. The name moves to the next
+    /// line if the type leaves no room for it, and several variables wrap
+    /// one per line.
+    fn var_decl(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let mut rest = elements.as_slice();
+        let mut docs = Vec::new();
+        if let Some((modifiers, after)) = rest.split_first()
+            && modifiers.kind() == MODIFIERS
+        {
+            docs.push(self.element(modifiers));
+            docs.push(space());
+            rest = after;
+        }
+        let (ty, mut rest) = rest.split_first()?;
+        ty.as_node()?;
+        let semi = match rest.split_last() {
+            Some((semi, before)) if semi.kind() == SEMI => {
+                rest = before;
+                Some(semi)
+            }
+            _ => None,
+        };
+        let (first, others) = rest.split_first()?;
+        if first.kind() != VARIABLE_DECLARATOR {
+            return None;
+        }
+
+        let continuation = self.continuation_indent();
+        let after_type = self.tag();
+        let mut declaration = vec![tagged_group(
+            after_type,
+            concat(vec![
+                indent(continuation, self.element(ty)),
+                indent(continuation, Doc::Line),
+            ]),
+        )];
+        if others.is_empty() {
+            declaration.push(indent_if(after_type, continuation, self.element(first)));
+        } else {
+            declaration.push(self.element(first));
+            declaration.push(indent(continuation, self.comma_separated(others)));
+        }
+        docs.push(group(concat(declaration)));
+        if let Some(semi) = semi {
+            docs.push(self.element(semi));
+        }
+        Some(concat(docs))
+    }
+
+    /// `A | B` in a `catch`: wraps before every `|` or before none.
+    fn union_type(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let mut docs = Vec::new();
+        for element in &elements {
+            if element.kind() == PIPE {
+                docs.push(Doc::Line);
+                docs.push(self.element(element));
+                docs.push(space());
+            } else {
+                docs.push(self.element(element));
+            }
+        }
+        Some(group(indent(self.continuation_indent(), concat(docs))))
+    }
+
+    /// A parameter: the name moves to the next line if the type leaves no
+    /// room for it.
+    fn param(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let (name, before) = elements.split_last()?;
+        let (ty, modifiers) = before.split_last()?;
+        if name.kind() != IDENT || ty.as_node().is_none_or(|ty| ty.kind() == MODIFIERS) {
+            return None;
+        }
+        let mut docs = Vec::new();
+        match modifiers {
+            [] => {}
+            [modifiers] if modifiers.kind() == MODIFIERS => {
+                docs.push(self.element(modifiers));
+                docs.push(space());
+            }
+            _ => return None,
+        }
+        if ty.kind() == UNION_TYPE {
+            docs.push(self.element(ty));
+            docs.push(space());
+        } else {
+            docs.push(group(concat(vec![
+                self.element(ty),
+                indent(self.continuation_indent(), Doc::Line),
+            ])));
+        }
+        docs.push(self.element(name));
+        Some(concat(docs))
     }
 
     /// The braces of a class, interface, enum, record or annotation body.
@@ -705,6 +1012,70 @@ impl<'a> Formatter<'a> {
         Some(concat(docs))
     }
 
+    /// `for (init; condition; update)`: the three parts wrap one per line.
+    fn for_stmt(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let close = elements.iter().rposition(|el| el.kind() == R_PAREN)?;
+        let [keyword, open, header @ ..] = &elements[..close] else {
+            return None;
+        };
+        if open.kind() != L_PAREN || close + 2 != elements.len() {
+            return None;
+        }
+        let mut inner = Vec::new();
+        for (i, part) in header.split(|el| el.kind() == SEMI).enumerate() {
+            if i > 0 {
+                inner.push(text(";"));
+                inner.push(Doc::Line);
+            }
+            inner.push(self.spaced(part));
+        }
+        // The `;` tokens were written by hand: they must carry no comments.
+        let semis = header.iter().filter(|el| el.kind() == SEMI);
+        let commented = |el: &SyntaxElement| {
+            el.as_token()
+                .and_then(|semi| self.trivia(semi))
+                .is_some_and(|trivia| !trivia.leading.is_empty() || !trivia.trailing.is_empty())
+        };
+        if semis.clone().count() != 2 || semis.into_iter().any(commented) {
+            return None;
+        }
+        Some(concat(vec![
+            self.element(keyword),
+            space(),
+            self.element(open),
+            group(indent(self.continuation_indent(), concat(inner))),
+            self.element(&elements[close]),
+            self.body(&elements[close + 1]),
+        ]))
+    }
+
+    /// `for (Type name : values)`: the values move to the next line if they
+    /// do not fit.
+    fn foreach_stmt(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let [keyword, open, variable, colon, values, close, body] = elements.as_slice() else {
+            return None;
+        };
+        if colon.kind() != COLON {
+            return None;
+        }
+        Some(concat(vec![
+            self.element(keyword),
+            space(),
+            self.element(open),
+            self.element(variable),
+            space(),
+            self.element(colon),
+            group(indent(
+                self.continuation_indent(),
+                concat(vec![Doc::Line, self.element(values)]),
+            )),
+            self.element(close),
+            self.body(body),
+        ]))
+    }
+
     fn loop_stmt(&self, node: &SyntaxNode) -> Option<Doc> {
         let elements: Vec<SyntaxElement> = significant_children(node).collect();
         let (body, header) = elements.split_last()?;
@@ -802,10 +1173,11 @@ impl<'a> Formatter<'a> {
             rest.push(space());
             rest.push(self.element(operand));
         }
-        Some(group(concat(vec![
-            self.node(&first),
-            indent(self.continuation_indent(), concat(rest)),
-        ])))
+        // The first operand is indented too: if it wraps, its lines sit to
+        // the right of the operators that follow it.
+        let mut operands = vec![self.node(&first)];
+        operands.extend(rest);
+        Some(group(indent(self.continuation_indent(), concat(operands))))
     }
 
     fn conditional(&self, node: &SyntaxNode) -> Option<Doc> {
