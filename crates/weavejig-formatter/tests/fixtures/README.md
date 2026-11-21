@@ -10,5 +10,5 @@ scoring harness (`cargo xtask score`) is what measures that.
 After an intended change, regenerate them and review the diff:
 
 ```bash
-WEAVEJIG_UPDATE_FIXTURES=1 cargo test -p weavejig_formatter --test fixtures
+WEAVEJIG_UPDATE_FIXTURES=1 cargo test -p weavejig-formatter --test fixtures
 ```

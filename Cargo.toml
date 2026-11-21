@@ -11,9 +11,9 @@ repository = "https://github.com/weavefoundry/weavejig"
 publish = false
 
 [workspace.dependencies]
-weavejig_syntax = { path = "crates/weavejig_syntax" }
-weavejig_formatter = { path = "crates/weavejig_formatter" }
-weavejig_linter = { path = "crates/weavejig_linter" }
+weavejig-syntax = { path = "crates/weavejig-syntax" }
+weavejig-formatter = { path = "crates/weavejig-formatter" }
+weavejig-linter = { path = "crates/weavejig-linter" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -38,11 +38,11 @@ strip = true
 
 # The scoring harness parses and formats whole codebases; unoptimised builds
 # make that needlessly slow.
-[profile.dev.package.weavejig_syntax]
+[profile.dev.package.weavejig-syntax]
 opt-level = 2
-[profile.dev.package.weavejig_formatter]
+[profile.dev.package.weavejig-formatter]
 opt-level = 2
-[profile.dev.package.weavejig_linter]
+[profile.dev.package.weavejig-linter]
 opt-level = 2
 [profile.dev.package.rowan]
 opt-level = 2

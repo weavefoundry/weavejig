@@ -12,9 +12,9 @@ name = "weavejig"
 path = "src/main.rs"
 
 [dependencies]
-weavejig_formatter.workspace = true
-weavejig_linter.workspace = true
-weavejig_syntax.workspace = true
+weavejig-formatter.workspace = true
+weavejig-linter.workspace = true
+weavejig-syntax.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true

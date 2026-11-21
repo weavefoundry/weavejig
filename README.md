@@ -144,9 +144,9 @@ cargo xtask score
 
 | Path | What |
 |---|---|
-| `crates/weavejig_syntax` | Lexer, parser and lossless syntax tree |
-| `crates/weavejig_formatter` | Syntax tree → layout document → text |
-| `crates/weavejig_linter` | Lint rules and fixes, one module per rule |
+| `crates/weavejig-syntax` | Lexer, parser and lossless syntax tree |
+| `crates/weavejig-formatter` | Syntax tree → layout document → text |
+| `crates/weavejig-linter` | Lint rules and fixes, one module per rule |
 | `crates/weavejig` | The command-line binary |
 | `xtask` | The scoring harness |
 | `scoring.toml` | Pinned reference tools and corpus |
@@ -169,11 +169,11 @@ The `held-out` set is for measuring only. `cargo xtask score --set held-out` pri
 
 ### Adding a lint rule
 
-1. Add a module in `crates/weavejig_linter/src/rules/` with a unit struct implementing `Rule` and a `static META` naming the Checkstyle check it mirrors.
+1. Add a module in `crates/weavejig-linter/src/rules/` with a unit struct implementing `Rule` and a `static META` naming the Checkstyle check it mirrors.
 2. List it in `ALL` in `rules/mod.rs`.
-3. Add cases to `crates/weavejig_linter/tests/rules.rs`.
+3. Add cases to `crates/weavejig-linter/tests/rules.rs`.
 4. Run `cargo xtask score --set dev` and compare with Checkstyle.
 
 ### Changing the formatter
 
-Formatting rules live in `crates/weavejig_formatter/src/format.rs`; a node kind without a rule is laid out on one line by the spacing table in `spacing.rs`. Fixtures in `crates/weavejig_formatter/tests/fixtures/` record current output so that changes show up in review; see the README there.
+Formatting rules live in `crates/weavejig-formatter/src/format.rs`; a node kind without a rule is laid out on one line by the spacing table in `spacing.rs`. Fixtures in `crates/weavejig-formatter/tests/fixtures/` record current output so that changes show up in review; see the README there.

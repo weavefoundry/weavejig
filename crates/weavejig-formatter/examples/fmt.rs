@@ -1,5 +1,5 @@
 //! Formats the files given on the command line and prints the result.
-//! `cargo run -p weavejig_formatter --example fmt -- File.java`
+//! `cargo run -p weavejig-formatter --example fmt -- File.java`
 
 fn main() {
     for path in std::env::args().skip(1) {

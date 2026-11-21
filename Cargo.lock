@@ -567,27 +567,27 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
- "weavejig_formatter",
- "weavejig_linter",
- "weavejig_syntax",
+ "weavejig-formatter",
+ "weavejig-linter",
+ "weavejig-syntax",
 ]
 
 [[package]]
-name = "weavejig_formatter"
+name = "weavejig-formatter"
 version = "0.0.0"
 dependencies = [
- "weavejig_syntax",
+ "weavejig-syntax",
 ]
 
 [[package]]
-name = "weavejig_linter"
+name = "weavejig-linter"
 version = "0.0.0"
 dependencies = [
- "weavejig_syntax",
+ "weavejig-syntax",
 ]
 
 [[package]]
-name = "weavejig_syntax"
+name = "weavejig-syntax"
 version = "0.0.0"
 dependencies = [
  "rowan",
@@ -638,9 +638,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "toml",
- "weavejig_formatter",
- "weavejig_linter",
- "weavejig_syntax",
+ "weavejig-formatter",
+ "weavejig-linter",
+ "weavejig-syntax",
 ]
 
 [[package]]
