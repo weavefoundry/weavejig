@@ -1,5 +1,9 @@
 //! Fixture tests: `NAME.input.java` must format to `NAME.expected.java`.
 //! See `fixtures/README.md`.
+//!
+//! The fixtures in `fixtures/` record WeaveJig's own output. Those in
+//! `fixtures/reference/` record google-java-format's output and are never
+//! regenerated from WeaveJig.
 
 use std::fs;
 use std::path::Path;
@@ -45,4 +49,33 @@ fn fixtures() {
         "{}\n\nIf the change is intended, rerun with WEAVEJIG_UPDATE_FIXTURES=1.",
         failures.join("\n")
     );
+}
+
+#[test]
+fn reference_fixtures() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/reference");
+    let mut checked = 0;
+    let mut failures = Vec::new();
+    for entry in fs::read_dir(&dir).unwrap() {
+        let input_path = entry.unwrap().path();
+        let Some(name) = input_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".input.java"))
+        else {
+            continue;
+        };
+        let input = fs::read_to_string(&input_path).unwrap();
+        let expected = fs::read_to_string(dir.join(format!("{name}.expected.java"))).unwrap();
+        let actual = format(&input, &FormatOptions::default())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        if actual != expected {
+            failures.push(format!(
+                "--- {name}: google-java-format\n{expected}\n--- {name}: WeaveJig\n{actual}"
+            ));
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "no fixtures found in {}", dir.display());
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

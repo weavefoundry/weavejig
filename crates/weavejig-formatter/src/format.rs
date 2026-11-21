@@ -6,6 +6,7 @@
 //! a construct needs line breaks or indentation.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 
 use weavejig_syntax::{
     NodeOrToken, SyntaxElement, SyntaxKind, SyntaxKind::*, SyntaxNode, SyntaxToken, TextSize,
@@ -22,6 +23,38 @@ pub(crate) struct Formatter<'a> {
     options: &'a FormatOptions,
     /// A token whose leading comments have already been printed elsewhere.
     skip_leading: Cell<Option<TextSize>>,
+    /// Simple names of imported annotations that are known to annotate types
+    /// rather than declarations, such as JSpecify's `@Nullable`.
+    type_annotations: HashSet<String>,
+}
+
+/// Annotations that google-java-format keeps next to the type they annotate
+/// when they are imported by name.
+const TYPE_ANNOTATIONS: [&str; 4] = [
+    "org.jspecify.annotations.Nullable",
+    "org.jspecify.annotations.NonNull",
+    "org.checkerframework.checker.nullness.qual.Nullable",
+    "org.checkerframework.checker.nullness.qual.NonNull",
+];
+
+/// The dotted name an import declaration names, and whether it is static.
+fn import_name(import: &SyntaxNode) -> (bool, String) {
+    let mut is_static = false;
+    let mut name = String::new();
+    for element in significant_children(import) {
+        match element.kind() {
+            IMPORT_KW | SEMI => {}
+            STATIC_KW => is_static = true,
+            _ => name.push_str(&element.to_string()),
+        }
+    }
+    (is_static, name.split_whitespace().collect())
+}
+
+fn has_arguments(annotation: &SyntaxElement) -> bool {
+    annotation
+        .as_node()
+        .is_some_and(|a| a.children().any(|c| c.kind() == ANNOTATION_ARGS))
 }
 
 fn first_of(element: &SyntaxElement) -> Option<SyntaxToken> {
@@ -75,10 +108,18 @@ fn comment_doc(comment: &Comment, trailing: bool) -> Doc {
 
 impl<'a> Formatter<'a> {
     pub(crate) fn new(root: &SyntaxNode, options: &'a FormatOptions) -> Formatter<'a> {
+        let type_annotations = root
+            .children()
+            .filter(|child| child.kind() == IMPORT_DECL)
+            .map(|import| import_name(&import))
+            .filter(|(is_static, name)| !is_static && TYPE_ANNOTATIONS.contains(&name.as_str()))
+            .filter_map(|(_, name)| name.rsplit('.').next().map(str::to_string))
+            .collect();
         Formatter {
             comments: Comments::collect(root),
             options,
             skip_leading: Cell::new(None),
+            type_annotations,
         }
     }
 
@@ -315,16 +356,8 @@ impl<'a> Formatter<'a> {
         let mut entries: Vec<(bool, String, &SyntaxNode)> = imports
             .iter()
             .map(|import| {
-                let mut is_static = false;
-                let mut name = String::new();
-                for element in significant_children(import) {
-                    match element.kind() {
-                        IMPORT_KW | SEMI => {}
-                        STATIC_KW => is_static = true,
-                        _ => name.push_str(&element.to_string()),
-                    }
-                }
-                (!is_static, name.split_whitespace().collect(), *import)
+                let (is_static, name) = import_name(import);
+                (!is_static, name, *import)
             })
             .collect();
         entries.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
@@ -372,37 +405,82 @@ impl<'a> Formatter<'a> {
 
     // --- Declarations ------------------------------------------------------
 
-    /// Annotations on a declaration go on their own lines above it; on a
-    /// parameter or local variable they stay inline. Fields are in between:
-    /// their annotations stay inline unless one takes arguments.
-    fn modifiers(&self, node: &SyntaxNode) -> Doc {
-        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+    /// How many of the annotations at the front of a modifier list go on
+    /// lines of their own, above the declaration.
+    ///
+    /// Annotations that follow a keyword (`public @Nullable String`) always
+    /// stay inline, and so do known type annotations that come right before
+    /// the type. Of the rest:
+    ///
+    /// - on a class, method, constructor or enum constant, all of them get a
+    ///   line each;
+    /// - on a field, all or none do: all if any annotation takes arguments;
+    /// - on a local variable or resource, all or none do: none only for a
+    ///   single annotation without arguments;
+    /// - on a parameter or a `for` variable, none do.
+    fn annotation_lines(&self, modifiers: &SyntaxNode) -> usize {
+        let elements: Vec<SyntaxElement> = significant_children(modifiers).collect();
         let leading = elements
             .iter()
             .take_while(|el| el.kind() == ANNOTATION)
             .count();
-        let has_arguments = |element: &SyntaxElement| {
-            element
-                .as_node()
-                .is_some_and(|a| a.children().any(|c| c.kind() == ANNOTATION_ARGS))
+        let Some(parent) = modifiers.parent() else {
+            return 0;
         };
-        let vertical = match node.parent().map(|parent| parent.kind()) {
-            Some(
-                CLASS_DECL | INTERFACE_DECL | ENUM_DECL | RECORD_DECL | ANNOTATION_TYPE_DECL
-                | METHOD_DECL | CONSTRUCTOR_DECL | ENUM_CONSTANT | PACKAGE_DECL | MODULE_DECL,
-            ) => true,
-            Some(FIELD_DECL) => elements[..leading].iter().any(has_arguments),
+        let kind = parent.kind();
+        let typed = matches!(kind, METHOD_DECL | FIELD_DECL | LOCAL_VAR_DECL | RESOURCE);
+        let type_use = if typed && leading == elements.len() {
+            elements
+                .iter()
+                .rev()
+                .take_while(|el| self.is_type_annotation(el))
+                .count()
+        } else {
+            0
+        };
+        let declaration = leading - type_use;
+        let any_arguments = elements[..declaration].iter().any(has_arguments)
+            || elements[leading..].iter().any(has_arguments);
+        let vertical = match kind {
+            CLASS_DECL | INTERFACE_DECL | ENUM_DECL | RECORD_DECL | ANNOTATION_TYPE_DECL
+            | METHOD_DECL | CONSTRUCTOR_DECL | ENUM_CONSTANT | PACKAGE_DECL | MODULE_DECL => true,
+            FIELD_DECL => any_arguments,
+            LOCAL_VAR_DECL => {
+                let in_foreach = parent.parent().is_some_and(|p| p.kind() == FOREACH_STMT);
+                !in_foreach && (declaration > 1 || any_arguments)
+            }
+            RESOURCE => declaration > 1 || any_arguments,
             _ => false,
         };
-        if !vertical {
+        if vertical { declaration } else { 0 }
+    }
+
+    /// Whether `annotation` is a marker annotation whose simple name was
+    /// imported from a package of type annotations.
+    fn is_type_annotation(&self, annotation: &SyntaxElement) -> bool {
+        if annotation.kind() != ANNOTATION || has_arguments(annotation) {
+            return false;
+        }
+        let name: String = annotation
+            .to_string()
+            .trim_start_matches('@')
+            .split_whitespace()
+            .collect();
+        self.type_annotations.contains(&name)
+    }
+
+    fn modifiers(&self, node: &SyntaxNode) -> Doc {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let lines = self.annotation_lines(node);
+        if lines == 0 {
             return self.spaced(&elements);
         }
         let mut docs = Vec::new();
-        for annotation in &elements[..leading] {
+        for annotation in &elements[..lines] {
             docs.push(self.element(annotation));
             docs.push(Doc::HardLine);
         }
-        docs.push(self.spaced(&elements[leading..]));
+        docs.push(self.spaced(&elements[lines..]));
         concat(docs)
     }
 
@@ -422,8 +500,9 @@ impl<'a> Formatter<'a> {
             return Some(concat(vec![self.token(open), self.token(close)]));
         }
 
+        let in_enum = node.parent().is_some_and(|p| p.kind() == ENUM_DECL);
         let mut body = Vec::new();
-        let mut previous: Option<SyntaxKind> = None;
+        let mut previous: Option<SyntaxNode> = None;
         for member in members {
             let member = match member {
                 // The `,` and `;` of enum constants stay on the constant's line.
@@ -436,22 +515,29 @@ impl<'a> Formatter<'a> {
                 }
                 NodeOrToken::Node(member) => member,
             };
-            let kind = member.kind();
-            // Fields, and enum constants, may be packed together or spaced
-            // out as the author chose; everything else gets a blank line.
-            let keeps_spacing = match previous {
-                None => true,
-                Some(previous) => {
-                    previous == kind && matches!(kind, FIELD_DECL | ENUM_CONSTANT | EMPTY_DECL)
+            // Enum constants, and fields without Javadoc or annotation lines,
+            // may be packed together or spaced out as the author chose;
+            // everything else gets a blank line.
+            let separator = match previous.as_ref().map(|p| (p.kind(), p)) {
+                // A blank line before the first enum constant is dropped.
+                None if in_enum => Doc::HardLine,
+                None => self.separator(member),
+                Some((ENUM_CONSTANT, _)) if member.kind() == ENUM_CONSTANT => {
+                    self.separator(member)
                 }
+                Some((ENUM_CONSTANT | FIELD_DECL, previous))
+                    if member.kind() == FIELD_DECL
+                        && !self.is_spaced_out(previous)
+                        && !self.is_spaced_out(member) =>
+                {
+                    self.separator(member)
+                }
+                Some((EMPTY_DECL, _)) if member.kind() == EMPTY_DECL => self.separator(member),
+                Some(_) => Doc::BlankLine,
             };
-            body.push(if keeps_spacing {
-                self.separator(member)
-            } else {
-                Doc::BlankLine
-            });
+            body.push(separator);
             body.push(self.with_comments(&NodeOrToken::Node(member.clone())));
-            previous = Some(kind);
+            previous = Some(member.clone());
         }
         self.dangling_comments(close, &mut body);
         Some(concat(vec![
@@ -460,6 +546,48 @@ impl<'a> Formatter<'a> {
             Doc::HardLine,
             self.token_without_leading(close),
         ]))
+    }
+
+    /// Whether a field always has blank lines around it: one with Javadoc,
+    /// or with annotations on lines of their own.
+    fn is_spaced_out(&self, member: &SyntaxNode) -> bool {
+        if member.kind() != FIELD_DECL {
+            return false;
+        }
+        let javadoc = first_token(member)
+            .and_then(|first| {
+                self.trivia(&first)
+                    .map(|t| t.leading.iter().any(Comment::is_javadoc))
+            })
+            .unwrap_or(false);
+        javadoc
+            || member
+                .children()
+                .find(|child| child.kind() == MODIFIERS)
+                .is_some_and(|modifiers| self.annotation_lines(&modifiers) > 0)
+    }
+
+    /// Whether an empty block is written `{}`. That is so for the body of a
+    /// method, lambda or loop; a block that is one of several belonging to a
+    /// statement (`if`/`else`, `try`/`catch`) is written with the braces on
+    /// separate lines, as is a block standing on its own.
+    fn empty_block_stays_closed(&self, block: &SyntaxNode) -> bool {
+        let Some(parent) = block.parent() else {
+            return false;
+        };
+        match parent.kind() {
+            METHOD_DECL | CONSTRUCTOR_DECL | LAMBDA_EXPR | SWITCH_RULE | WHILE_STMT | FOR_STMT
+            | FOREACH_STMT | DO_STMT => block.kind() == BLOCK,
+            IF_STMT => {
+                let has_else = parent.children_with_tokens().any(|el| el.kind() == ELSE_KW);
+                let is_else_branch = parent.parent().is_some_and(|p| p.kind() == IF_STMT);
+                !has_else && !is_else_branch
+            }
+            TRY_STMT => !parent
+                .children()
+                .any(|child| matches!(child.kind(), CATCH_CLAUSE | FINALLY_CLAUSE)),
+            _ => false,
+        }
     }
 
     // --- Statements --------------------------------------------------------
@@ -478,12 +606,19 @@ impl<'a> Formatter<'a> {
             .filter(|t| t.kind() == R_BRACE)?;
         let statements = &elements[1..elements.len() - 1];
         if statements.is_empty() && !self.has_dangling_comments(close) {
-            return Some(concat(vec![self.token(open), self.token(close)]));
+            return Some(if self.empty_block_stays_closed(node) {
+                concat(vec![self.token(open), self.token(close)])
+            } else {
+                concat(vec![self.token(open), Doc::HardLine, self.token(close)])
+            });
         }
+        // A blank line after the `{` is kept, except in a lambda or a switch.
+        let keeps_first_blank =
+            node.kind() == BLOCK && node.parent().is_none_or(|p| p.kind() != LAMBDA_EXPR);
         let mut body = Vec::new();
         for (i, statement) in statements.iter().enumerate() {
             match statement.as_node() {
-                Some(node) if i > 0 => body.push(self.separator(node)),
+                Some(node) if i > 0 || keeps_first_blank => body.push(self.separator(node)),
                 _ => body.push(Doc::HardLine),
             }
             body.push(self.with_comments(statement));

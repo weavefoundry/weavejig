@@ -103,7 +103,7 @@ fn spacing() {
     );
     assert_eq!(
         fmt_statements("synchronized(this){}"),
-        "synchronized (this) {}"
+        "synchronized (this) {\n}"
     );
     assert_eq!(
         fmt_statements("Object o=new Object(){};"),
@@ -145,6 +145,7 @@ fn annotations_go_above_declarations_but_stay_inline_elsewhere() {
 @B(1)
 class C {
   @A int f;
+
   @B(1)
   int g;
 
@@ -169,10 +170,11 @@ fn imports_are_sorted_static_first() {
 
 #[test]
 fn blank_lines() {
-    // Kept between statements (at most one), dropped at the ends of blocks.
+    // Kept between statements and after the opening brace (at most one),
+    // dropped before the closing brace.
     assert_eq!(
         fmt_statements("\n\n a();\n\n\n\n b();\n c();\n\n"),
-        "a();\n\nb();\nc();"
+        "\na();\n\nb();\nc();"
     );
     // Members are separated by a blank line; fields may be packed.
     assert_eq!(

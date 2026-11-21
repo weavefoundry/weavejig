@@ -17,6 +17,12 @@ pub(crate) struct Comment {
     pub(crate) newlines_before: u32,
 }
 
+impl Comment {
+    pub(crate) fn is_javadoc(&self) -> bool {
+        self.text.starts_with("/**") && self.text.len() > 4
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct TokenTrivia {
     /// Comments printed before the token.

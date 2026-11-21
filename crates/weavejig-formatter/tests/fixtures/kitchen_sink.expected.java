@@ -12,6 +12,7 @@ public class Long<T> extends Base<T> implements Runnable, Comparable<Long<T>> {
   @Inject
   @Named("x")
   private Foo foo;
+
   @Nullable private Bar bar;
 
   /**
@@ -71,7 +72,8 @@ public class Long<T> extends Base<T> implements Runnable, Comparable<Long<T>> {
       run();
     } catch (final Exception e) {
       /* ignored */
-    } finally {}
+    } finally {
+    }
     Object o = new int[2][3], p = this.<String>id("x"), q = Foo.<A, B>make(), r = String[]::new;
     label:
     while (true) {
@@ -87,7 +89,6 @@ public class Long<T> extends Base<T> implements Runnable, Comparable<Long<T>> {
     },
     @Deprecated
     C;
-
     int x;
   }
 
