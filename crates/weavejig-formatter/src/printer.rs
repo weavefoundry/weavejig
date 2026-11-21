@@ -96,6 +96,29 @@ pub(crate) fn print(doc: &Doc, line_width: usize) -> String {
                 };
                 stack.push((indent + extra, flat, doc));
             }
+            Doc::FillBreak(doc, _) => {
+                let fits_here = flat
+                    || (out.pending == 0
+                        && fits(doc, &stack, line_width as isize - out.column as isize - 1));
+                if fits_here {
+                    out.space();
+                } else {
+                    out.newline(1, indent);
+                }
+                stack.push((indent, flat, doc));
+            }
+            Doc::GroupIf(tag, doc, forced) => {
+                let flat = flat
+                    || (!forced && !broken.contains(tag) && {
+                        let column = if out.pending > 0 {
+                            out.pending_indent
+                        } else {
+                            out.column
+                        };
+                        fits(doc, &stack, line_width as isize - column as isize)
+                    });
+                stack.push((indent, flat, doc));
+            }
             Doc::Group(doc, forced) | Doc::TaggedGroup(_, doc, forced) => {
                 let flat = flat
                     || (!forced && {
@@ -149,9 +172,15 @@ fn fits(doc: &Doc, rest: &[(usize, bool, &Doc)], mut remaining: isize) -> bool {
             Doc::Line | Doc::SoftLine | Doc::HardLine | Doc::BlankLine => return true,
             Doc::Concat(docs, _) => stack.extend(docs.iter().rev().map(|doc| (flat, doc))),
             Doc::Indent(_, doc, _) | Doc::IndentIf(_, _, doc, _) => stack.push((flat, doc)),
-            Doc::Group(doc, forced) | Doc::TaggedGroup(_, doc, forced) => {
-                stack.push((flat && !forced, doc))
+            Doc::Group(doc, forced)
+            | Doc::TaggedGroup(_, doc, forced)
+            | Doc::GroupIf(_, doc, forced) => stack.push((flat && !forced, doc)),
+            Doc::FillBreak(doc, _) if flat => {
+                remaining -= 1;
+                stack.push((flat, doc));
             }
+            // The next item of a fill starts a new line if need be.
+            Doc::FillBreak(..) => return true,
         }
         if remaining < 0 {
             return false;

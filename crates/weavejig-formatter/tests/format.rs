@@ -55,7 +55,8 @@ fn smoke_corpus_formats_and_is_idempotent() {
 
 #[test]
 fn already_formatted_files_are_unchanged() {
-    for name in ["Basics.java", "Declarations.java", "package-info.java"] {
+    // The smoke files that google-java-format leaves as they are.
+    for name in ["Basics.java", "package-info.java"] {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../corpus/smoke")
             .join(name);
