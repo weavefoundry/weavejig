@@ -88,12 +88,14 @@ impl Rule for ModifierOrder {
         let leading = all.iter().take_while(|m| m.keyword.is_none()).count();
         let rest = &all[leading..];
 
-        // An annotation between keywords is out of place. One after the last
-        // keyword is a type annotation (`public @Nullable String f()`).
+        // An annotation between keywords is out of place. Those after the
+        // last keyword are type annotations (`public @Nullable String f()`,
+        // `private final @NonNull @Valid Foo x`).
+        let last_keyword = rest.iter().rposition(|m| m.keyword.is_some());
         if let Some(annotation) = rest
             .iter()
             .enumerate()
-            .find(|(i, m)| m.keyword.is_none() && i + 1 < rest.len())
+            .find(|(i, m)| m.keyword.is_none() && last_keyword.is_some_and(|last| *i < last))
         {
             out.push(Diagnostic {
                 rule: META.id,

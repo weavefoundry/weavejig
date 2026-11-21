@@ -104,9 +104,11 @@ class C {
   public @Deprecated static int d;
   public static @Nullable String e;
   synchronized static final private void n() {}
+  private final @NonNull @Valid Foo f;
+  public @A @B static int g;
 }
 ";
-    assert_eq!(lines("modifier-order", text), [2, 3, 6, 8]);
+    assert_eq!(lines("modifier-order", text), [2, 3, 6, 8, 10]);
     let fixed = fixed("modifier-order", text);
     assert!(fixed.contains("static final int A"), "{fixed}");
     assert!(fixed.contains("public static void m"), "{fixed}");
@@ -115,7 +117,7 @@ class C {
         "{fixed}"
     );
     // A misplaced annotation has no automatic fix.
-    assert_eq!(lines("modifier-order", &fixed), [6]);
+    assert_eq!(lines("modifier-order", &fixed), [6, 10]);
 }
 
 #[test]
