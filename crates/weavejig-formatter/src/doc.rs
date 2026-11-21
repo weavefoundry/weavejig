@@ -80,6 +80,28 @@ impl Doc {
     }
 }
 
+impl Doc {
+    /// The width of the document printed on one line, ignoring any
+    /// mandatory line breaks in it.
+    pub(crate) fn flat_width(&self) -> usize {
+        match self {
+            Doc::Text(text) | Doc::Suffix(text) | Doc::LineComment(text) | Doc::Javadoc(text) => {
+                text.chars().count()
+            }
+            Doc::Space | Doc::Line => 1,
+            Doc::SoftLine | Doc::HardLine | Doc::BlankLine => 0,
+            Doc::Concat(docs, _) => docs.iter().map(Doc::flat_width).sum(),
+            Doc::Indent(_, doc, _)
+            | Doc::Group(doc, _)
+            | Doc::TaggedGroup(_, doc, _)
+            | Doc::IndentIf(_, _, doc, _)
+            | Doc::GroupIf(_, doc, _)
+            | Doc::NextLineIfFits(_, doc, _) => doc.flat_width(),
+            Doc::FillBreak(doc, _) => 1 + doc.flat_width(),
+        }
+    }
+}
+
 pub(crate) fn text(text: impl Into<String>) -> Doc {
     Doc::Text(text.into())
 }

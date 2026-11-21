@@ -347,6 +347,7 @@ impl<'a> Formatter<'a> {
             FOREACH_STMT => self.foreach_stmt(node),
             LABELED_STMT => self.labeled_stmt(node),
             RESOURCE_LIST => self.resource_list(node),
+            RESOURCE => self.resource(node),
             VARIABLE_DECLARATOR | ASSIGN_EXPR | ANNOTATION_PAIR => self.assignment(node),
             BINARY_EXPR => self.binary(node),
             CONDITIONAL_EXPR => self.conditional(node),
@@ -508,6 +509,26 @@ impl<'a> Formatter<'a> {
             _ => false,
         };
         if vertical { declaration } else { 0 }
+    }
+
+    /// How many annotations at the front of a modifier list annotate the
+    /// declaration: all of them, less any known type annotations that come
+    /// right before the type.
+    fn declaration_annotations(&self, modifiers: &SyntaxNode) -> usize {
+        let elements: Vec<SyntaxElement> = significant_children(modifiers).collect();
+        let leading = elements
+            .iter()
+            .take_while(|el| el.kind() == ANNOTATION)
+            .count();
+        if leading < elements.len() {
+            return leading;
+        }
+        let type_use = elements
+            .iter()
+            .rev()
+            .take_while(|el| self.is_type_annotation(el))
+            .count();
+        leading - type_use
     }
 
     /// Whether `annotation` is a marker annotation whose simple name was
@@ -755,15 +776,56 @@ impl<'a> Formatter<'a> {
     /// line if the type leaves no room for it, and several variables wrap
     /// one per line.
     fn var_decl(&self, node: &SyntaxNode) -> Option<Doc> {
+        let (declaration, semi, _) = self.var_decl_parts(node)?;
+        Some(concat(vec![declaration, semi]))
+    }
+
+    /// Whether a field's annotations, written on the declaration's line,
+    /// will move above it because the declaration is too long for one line.
+    /// Such a field is set off by blank lines.
+    fn field_wraps_annotations(&self, field: &SyntaxNode) -> bool {
+        let Some((declaration, semi, true)) = self.var_decl_parts(field) else {
+            return false;
+        };
+        // Fields sit in class bodies, so their indentation is known.
+        let depth = field
+            .ancestors()
+            .filter(|node| matches!(node.kind(), CLASS_BODY | BLOCK | SWITCH_GROUP))
+            .count();
+        let indent = depth * self.block_indent() as usize;
+        declaration.forces_break()
+            || indent + declaration.flat_width() + semi.flat_width()
+                > crate::FormatOptions::LINE_WIDTH
+    }
+
+    /// The parts of a variable declaration: the declaration, the `;` with
+    /// its comments (or nothing), and whether the declaration starts with
+    /// annotations that share its line.
+    fn var_decl_parts(&self, node: &SyntaxNode) -> Option<(Doc, Doc, bool)> {
         let elements: Vec<SyntaxElement> = significant_children(node).collect();
         let mut rest = elements.as_slice();
         let mut docs = Vec::new();
+        // Annotations that share the declaration's line, which then move
+        // above it together if the declaration does not fit on one line.
+        let mut inline_annotations = None;
         if let Some((modifiers, after)) = rest.split_first()
             && modifiers.kind() == MODIFIERS
         {
-            docs.push(self.element(modifiers));
-            docs.push(space());
             rest = after;
+            let modifiers = modifiers.as_node()?;
+            let parts: Vec<SyntaxElement> = significant_children(modifiers).collect();
+            let declaration_annotations = self.declaration_annotations(modifiers);
+            let in_foreach = node.parent().is_some_and(|p| p.kind() == FOREACH_STMT);
+            if !in_foreach && self.annotation_lines(modifiers) == 0 && declaration_annotations > 0 {
+                inline_annotations = Some(self.spaced(&parts[..declaration_annotations]));
+                if parts.len() > declaration_annotations {
+                    docs.push(self.spaced(&parts[declaration_annotations..]));
+                    docs.push(space());
+                }
+            } else {
+                docs.push(self.node(modifiers));
+                docs.push(space());
+            }
         }
         let (ty, mut rest) = rest.split_first()?;
         ty.as_node()?;
@@ -797,10 +859,15 @@ impl<'a> Formatter<'a> {
             declaration.push(indent(continuation, self.comma_separated(others)));
         }
         docs.push(group(concat(declaration)));
-        if let Some(semi) = semi {
-            docs.push(self.element(semi));
-        }
-        Some(concat(docs))
+        let semi = semi.map_or_else(|| concat(Vec::new()), |semi| self.element(semi));
+        Some(match inline_annotations {
+            Some(annotations) => (
+                group(concat(vec![annotations, Doc::Line, concat(docs)])),
+                semi,
+                true,
+            ),
+            None => (concat(docs), semi, false),
+        })
     }
 
     /// `A | B` in a `catch`: wraps before every `|` or before none.
@@ -842,7 +909,7 @@ impl<'a> Formatter<'a> {
             docs.push(space());
         } else {
             docs.push(group(concat(vec![
-                self.element(ty),
+                indent(self.continuation_indent(), self.element(ty)),
                 indent(self.continuation_indent(), Doc::Line),
             ])));
         }
@@ -873,7 +940,11 @@ impl<'a> Formatter<'a> {
             let member = match member {
                 // The `,` and `;` of enum constants stay on the constant's line.
                 NodeOrToken::Token(token) => {
-                    if previous.is_none() {
+                    // After a trailing comma, the `;` gets its own line.
+                    let after_comma = token.kind() == SEMI
+                        && weavejig_syntax::prev_significant_token(token)
+                            .is_some_and(|previous| previous.kind() == COMMA);
+                    if previous.is_none() || after_comma {
                         body.push(Doc::HardLine);
                     }
                     body.push(self.token(token));
@@ -932,6 +1003,7 @@ impl<'a> Formatter<'a> {
                 .children()
                 .find(|child| child.kind() == MODIFIERS)
                 .is_some_and(|modifiers| self.annotation_lines(&modifiers) > 0)
+            || self.field_wraps_annotations(member)
     }
 
     /// Whether an empty block is written `{}`. That is so for the body of a
@@ -1180,6 +1252,27 @@ impl<'a> Formatter<'a> {
         ]))
     }
 
+    /// `Type name = value` in a `try` header: the value moves to the next
+    /// line, level with the other resources, if it does not fit.
+    fn resource(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let equals = elements.iter().position(|el| el.kind() == EQ)?;
+        let [value] = &elements[equals + 1..] else {
+            return None;
+        };
+        // The value goes one indent in from the line the resource is on:
+        // the `try` line for the first, a line of its own for the others.
+        let first = node.prev_sibling().is_none();
+        let columns = if first { 0 } else { self.continuation_indent() };
+        Some(concat(vec![
+            self.spaced(&elements[..=equals]),
+            group(indent(
+                columns,
+                concat(vec![Doc::Line, self.element(value)]),
+            )),
+        ]))
+    }
+
     // --- Expressions -------------------------------------------------------
 
     /// `target = value`, for assignments, variable initializers and
@@ -1252,22 +1345,22 @@ impl<'a> Formatter<'a> {
         let [condition, question, then, colon, otherwise] = elements.as_slice() else {
             return None;
         };
-        Some(group(concat(vec![
-            self.element(condition),
-            indent(
-                self.continuation_indent(),
-                concat(vec![
-                    Doc::Line,
-                    self.element(question),
-                    space(),
-                    self.element(then),
-                    Doc::Line,
-                    self.element(colon),
-                    space(),
-                    self.element(otherwise),
-                ]),
-            ),
-        ])))
+        // The condition is indented too: if it wraps, its lines sit to the
+        // right of the `?` and `:` that follow it.
+        Some(group(indent(
+            self.continuation_indent(),
+            concat(vec![
+                self.element(condition),
+                Doc::Line,
+                self.element(question),
+                space(),
+                self.element(then),
+                Doc::Line,
+                self.element(colon),
+                space(),
+                self.element(otherwise),
+            ]),
+        )))
     }
 
     /// A chain of field accesses and method calls, such as `a.b().c()`.
@@ -1490,6 +1583,18 @@ impl<'a> Formatter<'a> {
                 self.element(close),
             ]));
         }
+        // `@SuppressWarnings({"a", "b"})`: the array's braces stay with the
+        // parentheses.
+        if let [NodeOrToken::Node(only)] = items
+            && node.kind() == ANNOTATION_ARGS
+            && only.kind() == ARRAY_INIT
+        {
+            return Some(concat(vec![
+                self.element(open),
+                self.node(only),
+                self.element(close),
+            ]));
+        }
         if node.kind() != ARG_LIST {
             return Some(wrapped(self.comma_separated(items)));
         }
@@ -1536,7 +1641,7 @@ impl<'a> Formatter<'a> {
                 self.element(close),
             ]));
         }
-        if arguments.iter().all(|argument| self.is_short(argument)) {
+        if self.fills(&arguments) {
             return Some(wrapped(self.filled(&arguments)));
         }
         if let Some((first, others)) = arguments.split_first()
@@ -1564,7 +1669,7 @@ impl<'a> Formatter<'a> {
     }
 
     /// Whether an item of a list is short enough for the list to be filled:
-    /// under ten characters, and without comments.
+    /// under ten characters.
     fn is_short(&self, item: &[SyntaxElement]) -> bool {
         let tokens: Vec<SyntaxToken> = item
             .iter()
@@ -1577,16 +1682,36 @@ impl<'a> Formatter<'a> {
                 NodeOrToken::Token(token) => vec![token.clone()],
             })
             .collect();
-        let commented = tokens.iter().any(|token| {
-            self.trivia(token)
-                .is_some_and(|t| !t.leading.is_empty() || !t.trailing.is_empty())
-        });
         let width: usize = tokens
             .iter()
             .filter(|token| token.kind() != COMMA)
             .map(|token| token.text().chars().count())
             .sum();
-        !commented && width < 10
+        width < 10
+    }
+
+    /// Whether a comment sits between the items of a list: before an item,
+    /// or after its comma.
+    fn has_comments_between(&self, items: &[&[SyntaxElement]]) -> bool {
+        items.iter().any(|item| {
+            let leading = item
+                .first()
+                .and_then(first_of)
+                .and_then(|first| self.trivia(&first).map(|t| !t.leading.is_empty()));
+            let trailing = item
+                .last()
+                .and_then(last_of)
+                .and_then(|last| self.trivia(&last).map(|t| !t.trailing.is_empty()));
+            leading == Some(true) || trailing == Some(true)
+        })
+    }
+
+    /// Whether the items of a list fill lines rather than take one each:
+    /// when all are short, or when comments stand between them. A comment
+    /// ends its line without making every other item take a line too.
+    fn fills(&self, items: &[&[SyntaxElement]]) -> bool {
+        items.iter().all(|item| self.is_short(item))
+            || (items.len() > 1 && self.has_comments_between(items))
     }
 
     /// Whether the source has the arguments two to a line, on at least two
@@ -1634,18 +1759,16 @@ impl<'a> Formatter<'a> {
         let values: Vec<&[SyntaxElement]> =
             items.split_inclusive(|el| el.kind() == COMMA).collect();
         let trailing_comma = items.last().is_some_and(|last| last.kind() == COMMA);
-        let mut inner = if trailing_comma {
-            // A trailing comma asks for one value per line.
-            let mut lines = Vec::new();
-            for value in &values {
-                lines.push(Doc::HardLine);
-                lines.push(self.spaced(value));
-            }
-            lines
-        } else if values.iter().all(|value| self.is_short(value)) {
-            vec![Doc::SoftLine, group(self.filled(&values))]
+        // A trailing comma puts the braces on lines of their own.
+        let first = if trailing_comma {
+            Doc::HardLine
         } else {
-            vec![Doc::SoftLine, group(self.comma_separated(items))]
+            Doc::SoftLine
+        };
+        let mut inner = if self.fills(&values) {
+            vec![first, group(self.filled(&values))]
+        } else {
+            vec![first, group(self.comma_separated(items))]
         };
         self.dangling_comments(close, &mut inner);
         Some(group(concat(vec![
