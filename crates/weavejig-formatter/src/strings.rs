@@ -500,7 +500,13 @@ pub(crate) fn reflow(formatted: &str, width: usize) -> Option<String> {
     edits.sort_by_key(|&(start, _, _)| start);
     let mut out = String::with_capacity(formatted.len() + edits.len() * 16);
     let mut done = 0;
-    for (start, end, replacement) in edits {
+    for (i, (start, end, replacement)) in edits.into_iter().enumerate() {
+        // Each edit was worked out from the columns of `formatted`. A run
+        // that starts on the line where the previous edit ended has moved,
+        // so it is left as it is rather than split for the wrong columns.
+        if i > 0 && !formatted[done..start].contains('\n') {
+            continue;
+        }
         out.push_str(&formatted[done..start]);
         out.push_str(&replacement);
         done = end;
@@ -726,6 +732,23 @@ mod tests {
         let long = "a".repeat(95);
         assert_eq!(pieces(&format!("abcd {long}"), 8, 14, 0).len(), 1);
         assert_eq!(pieces(&format!("abcde {long}"), 8, 14, 0).len(), 2);
+    }
+
+    #[test]
+    fn a_run_after_a_split_on_the_same_line_is_left_alone() {
+        let first = "ab ".repeat(30);
+        let first = first.trim_end();
+        let second = "cd ef gh ij kl mn";
+        let text = format!(
+            "class A {{\n  Object o = f(\"{first}\", \"{second}\");\n  Object p = g(\"{first}\");\n}}\n"
+        );
+        let out = reflow(&text, 100).unwrap();
+        // The first run is split...
+        assert!(!out.contains(&format!("f(\"{first}\"")), "{out}");
+        // ...so the second, on the same line, keeps its text...
+        assert!(out.contains(&format!(", \"{second}\");\n")), "{out}");
+        // ...while a run on a later line is still split.
+        assert!(!out.contains(&format!("g(\"{first}\");")), "{out}");
     }
 
     #[test]
