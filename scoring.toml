@@ -48,6 +48,28 @@ url = "https://github.com/google/gson.git"
 rev = "fcd416909db2bea96eb916bcfb2d0a83cb9b86c3" # gson-parent-2.15.0
 set = "dev"
 
+# Three codebases in other styles (four-space indentation, tabs, their own
+# wrapping), so that the formatter is tuned on more than code that is already
+# in google-java-format style.
+
+[[corpus]]
+name = "jsoup"
+url = "https://github.com/jhy/jsoup.git"
+rev = "5e3c2843106967cba8ac1b12e6f821518fb2f5d2" # jsoup-1.24.1
+set = "dev"
+
+[[corpus]]
+name = "zxing"
+url = "https://github.com/zxing/zxing.git"
+rev = "f651b0a0375676e47144f73397dddff8868b0e4c" # zxing-3.5.4
+set = "dev"
+
+[[corpus]]
+name = "junit-framework"
+url = "https://github.com/junit-team/junit-framework.git"
+rev = "f59f60d2cebdf2224235d81f781b1f310cbc8138" # r6.1.3
+set = "dev"
+
 [[corpus]]
 name = "error-prone"
 url = "https://github.com/google/error-prone.git"

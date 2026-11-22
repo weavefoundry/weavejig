@@ -4,10 +4,11 @@ mod fetch;
 mod java;
 mod manifest;
 mod score;
+mod scramble;
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::manifest::{Manifest, repo_root};
@@ -41,6 +42,12 @@ enum Task {
         /// How many disagreements to list for each part
         #[arg(long, default_value_t = 10, value_name = "N")]
         show: usize,
+    },
+    /// Print a file with its whitespace scrambled as the formatter score does,
+    /// to reproduce a disagreement on scrambled input
+    Scramble {
+        /// A Java file
+        file: PathBuf,
     },
     /// Download what scoring needs into `.weavejig/`
     Fetch {
@@ -92,6 +99,12 @@ fn run(cli: Cli) -> Result<()> {
             json,
             show,
         } => score(&manifest, &set, corpus, json, show),
+        Task::Scramble { file } => {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("cannot read {}", file.display()))?;
+            print!("{}", scramble::scramble(&text));
+            Ok(())
+        }
     }
 }
 
@@ -150,7 +163,8 @@ fn score(
 
     let scores = [
         score::parser(&sources, &jdk)?,
-        score::formatter(&sources, manifest)?,
+        score::formatter(&sources, manifest, score::FormatInput::AsIs)?,
+        score::formatter(&sources, manifest, score::FormatInput::Scrambled)?,
         score::linter(&sources, manifest)?,
         score::pmd(),
     ];
@@ -180,6 +194,9 @@ fn score(
             continue;
         }
         println!("\n{} disagreements with {}:", score.part, score.reference);
+        if score.reference.ends_with(", scrambled") {
+            println!("  (reproduce the input with `cargo xtask scramble <file>`)");
+        }
         for mismatch in score.mismatches.iter().take(show) {
             println!("  {mismatch}");
         }
