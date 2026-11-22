@@ -39,9 +39,9 @@ Early development. Everything below runs, but nothing is at parity yet: do not r
 
 | Part | What exists |
 |---|---|
-| Parser | Hand-written, lossless, error-tolerant, written for the Java 21 grammar. Agrees with `javac` on all 4,179 files of the dev corpus and on 2,548 of 2,549 held-out files. |
-| Formatter | Formats whole files in google-java-format style, Javadoc included. 97.0% of dev-corpus files (4,055 of 4,179) come out identical to google-java-format 2.0.0, and 76.3% of held-out files (1,946 of 2,549): the rules were tuned on the dev corpus. Not done: long string literals are not re-split, unused imports are not removed, modifiers are not reordered, and a tail of rarer wrapping cases differs. |
-| Linter | Six Checkstyle rules, five with fixes. Their diagnostics match Checkstyle on 78 of 80 in the dev corpus and all 1,083 in the held-out corpus. No PMD rules. |
+| Parser | Hand-written, lossless, error-tolerant, written for the Java 21 grammar. Agrees with `javac` on 6,636 of 6,640 dev-corpus files and on 2,548 of 2,549 held-out files. The 4 dev disagreements are JUnit tests that use unnamed variables (`_`), which are Java 22: `javac` 21 rejects them. |
+| Formatter | Formats whole files in google-java-format style, Javadoc included. 91.1% of dev-corpus files (6,045 of 6,636) come out identical to google-java-format 2.0.0, and 76.8% of held-out files (1,957 of 2,549). Most of the rules were tuned on guava, gson and commons-lang, where 97.2% match; jsoup, zxing and JUnit were added to the dev corpus later and match less well. Not done: long string literals are not re-split, unused imports are not removed, modifiers are not reordered, and a tail of rarer wrapping cases differs. |
+| Linter | Six Checkstyle rules, five with fixes. Their diagnostics match Checkstyle on 1,523 of 1,527 in the dev corpus and all 1,083 in the held-out corpus. No PMD rules. |
 | CLI | `check`, `format`, `rules`; text and JSON output; `weavejig.toml`. |
 | Scoring | `cargo xtask score` for the parser (`javac`), formatter (google-java-format) and linter (Checkstyle). PMD is not wired up. |
 
@@ -161,6 +161,12 @@ cargo xtask score
 cargo xtask fetch references          # google-java-format and Checkstyle jars
 cargo xtask fetch corpus --set dev    # the development codebases
 cargo xtask score --set dev --show 20 # scores, and the first 20 disagreements per part
+```
+
+The formatter is scored twice. The second row, `scrambled`, formats each file after its whitespace has been rewritten into another style (other indentation, other line wrapping, braces on their own line), keeping every token and comment. Much of the corpus is already in google-java-format style, so the first row alone would mostly test leaving formatted code alone. To see the scrambled input for a disagreement:
+
+```bash
+cargo xtask scramble path/to/File.java
 ```
 
 Reference tool versions and corpus commits are pinned in [`scoring.toml`](scoring.toml); downloads go to `.weavejig/` and are checked against the pinned SHA-256. The harness looks for a JDK in `WEAVEJIG_JAVA_HOME`, `JAVA_HOME`, then `PATH`.

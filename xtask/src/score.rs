@@ -15,6 +15,7 @@ use weavejig_syntax::{LineIndex, parse};
 
 use crate::java::{self, Jdk};
 use crate::manifest::{Manifest, cache_dir, repo_root};
+use crate::scramble::scramble;
 
 /// Files per reference-tool invocation, to stay under command-line limits.
 const CHUNK: usize = 400;
@@ -241,11 +242,25 @@ fn gjf_failures(stderr: &str) -> HashSet<String> {
         .collect()
 }
 
+/// What the formatter is scored on.
+#[derive(Clone, Copy, PartialEq)]
+pub enum FormatInput {
+    /// The corpus files as they are.
+    AsIs,
+    /// The corpus files with their whitespace rewritten by [`scramble`], so
+    /// that code already in google-java-format style still has to be
+    /// reformatted.
+    Scrambled,
+}
+
 /// Share of files that WeaveJig formats byte-for-byte like google-java-format.
-pub fn formatter(sources: &[Source], manifest: &Manifest) -> Result<Score> {
+pub fn formatter(sources: &[Source], manifest: &Manifest, input: FormatInput) -> Result<Score> {
     const PART: &str = "Formatter";
     let reference = manifest.reference("google-java-format")?;
-    let name = format!("google-java-format {}", reference.version);
+    let mut name = format!("google-java-format {}", reference.version);
+    if input == FormatInput::Scrambled {
+        name.push_str(", scrambled");
+    }
     let jar = reference.jar_path();
     if !jar.is_file() {
         return Ok(Score::unavailable(
@@ -257,6 +272,21 @@ pub fn formatter(sources: &[Source], manifest: &Manifest) -> Result<Score> {
     let jdk = match java::locate(reference.min_jdk) {
         Ok(jdk) => jdk,
         Err(why) => return Ok(Score::unavailable(PART, name, why)),
+    };
+
+    let scrambled: Vec<Source>;
+    let sources = match input {
+        FormatInput::AsIs => sources,
+        FormatInput::Scrambled => {
+            scrambled = sources
+                .par_iter()
+                .map(|source| Source {
+                    path: source.path.clone(),
+                    text: scramble(&source.text),
+                })
+                .collect();
+            &scrambled
+        }
     };
 
     // google-java-format rewrites copies of the files in place.
