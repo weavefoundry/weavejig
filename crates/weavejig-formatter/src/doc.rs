@@ -9,7 +9,9 @@
 pub(crate) enum Doc {
     Text(String),
     /// A trailing line comment. It counts when measuring whether a group
-    /// fits: code is wrapped to make room for the comment after it.
+    /// fits: code is wrapped to make room for the comment after it. One
+    /// that still runs past the line width is wrapped onto `//` lines that
+    /// start in its column.
     Suffix(String),
     /// A space, unless it would start a line.
     Space,
