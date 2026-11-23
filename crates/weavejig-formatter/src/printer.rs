@@ -82,7 +82,9 @@ pub(crate) fn print(doc: &Doc, line_width: usize) -> String {
             Doc::Line | Doc::SoftLine if flat && out.pending > 0 => out.pending_indent = indent,
             Doc::Line if flat => out.space(),
             Doc::SoftLine if flat => {}
-            Doc::Line | Doc::SoftLine | Doc::HardLine => out.newline(1, indent),
+            // `place_comment_breaks` has turned comment breaks into hard
+            // lines; one it has not is still a line break.
+            Doc::Line | Doc::SoftLine | Doc::HardLine | Doc::CommentBreak => out.newline(1, indent),
             Doc::BlankLine => out.newline(2, indent),
             Doc::Concat(docs, _) => {
                 stack.extend(docs.iter().rev().map(|doc| (indent, flat, doc)));
@@ -247,7 +249,9 @@ fn fits(doc: &Doc, rest: &[(usize, bool, &Doc)], mut remaining: isize) -> bool {
             Doc::Line if flat => remaining -= 1,
             Doc::SoftLine if flat => {}
             // A line break ends the line: everything measured so far fits.
-            Doc::Line | Doc::SoftLine | Doc::HardLine | Doc::BlankLine => return true,
+            Doc::Line | Doc::SoftLine | Doc::HardLine | Doc::BlankLine | Doc::CommentBreak => {
+                return true;
+            }
             Doc::Concat(docs, _) => stack.extend(docs.iter().rev().map(|doc| (flat, doc))),
             Doc::Indent(_, doc, _) | Doc::IndentIf(_, _, doc, _) => stack.push((flat, doc)),
             Doc::Group(doc, forced)
@@ -355,6 +359,33 @@ mod tests {
         ]);
         assert_eq!(print(&doc, 17), "aaaa bbbb // long\nc\n");
         assert_eq!(print(&doc, 16), "aaaa\nbbbb // long\nc\n");
+    }
+
+    #[test]
+    fn comment_breaks_leave_the_groups_they_end_flat() {
+        // `(aa bb // c` then `dd)`: the comment ends the inner group, so its
+        // line break belongs to the outer one, which alone breaks.
+        let inner = group(concat(vec![
+            text("aa"),
+            Doc::Line,
+            text("bb"),
+            Doc::Suffix(" // c".to_string()),
+            Doc::CommentBreak,
+        ]));
+        let doc = place_comment_breaks(group(indent(
+            2,
+            concat(vec![text("("), inner, Doc::Line, text("dd)")]),
+        )));
+        assert_eq!(print(&doc, 80), "(aa bb // c\n  dd)\n");
+
+        // A comment break that ends the whole document still ends its line.
+        let doc = place_comment_breaks(concat(vec![
+            text("a;"),
+            Doc::Suffix(" // c".to_string()),
+            Doc::CommentBreak,
+        ]));
+        assert!(!doc.has_comment_break());
+        assert_eq!(print(&doc, 80), "a; // c\n");
     }
 
     #[test]

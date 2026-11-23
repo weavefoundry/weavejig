@@ -112,7 +112,7 @@ pub fn format(text: &str, options: &FormatOptions) -> Result<String, FormatError
         ));
     }
     let root = parse.syntax();
-    let doc = format::Formatter::new(&root, options).node(&root);
+    let doc = doc::place_comment_breaks(format::Formatter::new(&root, options).node(&root));
     let formatted = printer::print(&doc, FormatOptions::LINE_WIDTH);
     let formatted = strings::reflow(&formatted, FormatOptions::LINE_WIDTH).unwrap_or(formatted);
     let formatted = with_line_separator(&formatted, line_separator(text));
