@@ -40,12 +40,12 @@ Early development. Everything below runs, but nothing is at parity yet: do not r
 | Part | What exists |
 |---|---|
 | Parser | Hand-written, lossless, error-tolerant, written for the Java 21 grammar. Agrees with `javac` on 6,636 of 6,640 dev-corpus files and on 2,548 of 2,549 held-out files. The 4 dev disagreements are JUnit tests that use unnamed variables (`_`), which are Java 22: `javac` 21 rejects them. |
-| Formatter | Formats whole files in google-java-format style, Javadoc included. 91.1% of dev-corpus files (6,045 of 6,636) come out identical to google-java-format 2.0.0, and 76.8% of held-out files (1,957 of 2,549). Most of the rules were tuned on guava, gson and commons-lang, where 97.2% match; jsoup, zxing and JUnit were added to the dev corpus later and match less well. Not done: long string literals are not re-split, unused imports are not removed, modifiers are not reordered, and a tail of rarer wrapping cases differs. |
+| Formatter | Formats whole files in google-java-format style, Javadoc included. 92.4% of dev-corpus files (6,134 of 6,636) come out identical to google-java-format 2.0.0, and 77.0% of held-out files (1,963 of 2,549). Most of the rules were tuned on guava, gson and commons-lang, where 97.5% match; jsoup, zxing and JUnit were added to the dev corpus later and match less well. Long string literals are split at word boundaries as google-java-format does. Not done: unused imports are not removed, modifiers are not reordered, and a tail of rarer wrapping cases differs. |
 | Linter | Six Checkstyle rules, five with fixes. Their diagnostics match Checkstyle on 1,523 of 1,527 in the dev corpus and all 1,083 in the held-out corpus. No PMD rules. |
 | CLI | `check`, `format`, `rules`; text and JSON output; `weavejig.toml`. |
 | Scoring | `cargo xtask score` for the parser (`javac`), formatter (google-java-format) and linter (Checkstyle). PMD is not wired up. |
 
-The formatter never changes anything but whitespace, import order and the wrapping of comments: it checks its own output against the input, and refuses to write a file if any token would differ or any comment would gain or lose text.
+The formatter never changes anything but whitespace, import order, the wrapping of comments and the splitting of long string literals: it checks its own output against the input, and refuses to write a file if any token would differ or any comment would gain or lose text. A string literal may only become, or be merged from, literals joined by `+` whose text, put together, is the same.
 
 ## Usage
 
@@ -182,4 +182,4 @@ The `held-out` set is for measuring only. `cargo xtask score --set held-out` pri
 
 ### Changing the formatter
 
-Formatting rules live in `crates/weavejig-formatter/src/format.rs`; a node kind without a rule is laid out on one line by the spacing table in `spacing.rs`. Fixtures in `crates/weavejig-formatter/tests/fixtures/` record current output so that changes show up in review; see the README there.
+Formatting rules live in `crates/weavejig-formatter/src/format.rs`; a node kind without a rule is laid out on one line by the spacing table in `spacing.rs`. Long string literals are split after layout, in `strings.rs`. Fixtures in `crates/weavejig-formatter/tests/fixtures/` record current output so that changes show up in review; see the README there.

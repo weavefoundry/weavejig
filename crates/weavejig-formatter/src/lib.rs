@@ -5,10 +5,14 @@
 //! break ([`format`](mod@format) and [`spacing`]), and print the document
 //! within the line width ([`printer`]).
 //!
+//! Finally, string literals that run past the line width are split into
+//! concatenations of shorter ones ([`strings`]).
+//!
 //! The result is then checked against the input: formatting may only change
-//! whitespace and the order of imports. If any other token or comment would
-//! be added, dropped or changed, [`format`] returns an error instead of the
-//! text, so a formatter bug cannot silently damage code.
+//! whitespace, the order of imports, and how string literals joined by `+`
+//! are split. If any other token or comment would be added, dropped or
+//! changed, [`format`] returns an error instead of the text, so a formatter
+//! bug cannot silently damage code.
 
 mod comments;
 mod doc;
@@ -16,6 +20,7 @@ mod format;
 mod javadoc;
 mod printer;
 mod spacing;
+mod strings;
 mod verify;
 
 use weavejig_syntax::{SyntaxError, parse};
@@ -92,6 +97,7 @@ pub fn format(text: &str, options: &FormatOptions) -> Result<String, FormatError
     let root = parse.syntax();
     let doc = format::Formatter::new(&root, options).node(&root);
     let formatted = printer::print(&doc, FormatOptions::LINE_WIDTH);
+    let formatted = strings::reflow(&formatted, FormatOptions::LINE_WIDTH).unwrap_or(formatted);
     let formatted = with_line_separator(&formatted, line_separator(text));
     verify::check(text, &formatted).map_err(FormatError::Internal)?;
     Ok(formatted)

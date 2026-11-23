@@ -1,12 +1,17 @@
 //! The safety net: formatted output must be the input with different
 //! whitespace, and nothing else.
 
-use weavejig_syntax::{SyntaxKind, lex, parse};
+use weavejig_syntax::{SyntaxKind, TextSize, lex, parse};
+
+use crate::strings;
 
 /// What a source file says, ignoring layout.
 #[derive(Debug, PartialEq, Eq)]
 struct Fingerprint {
-    /// Every token outside import declarations, in order.
+    /// Every token outside import declarations, in order, except that each
+    /// run of string literals joined by `+` counts as one token: long
+    /// strings are split and their pieces merged again, which leaves the
+    /// literals' joined text, and so the string's value, as it was.
     tokens: Vec<String>,
     /// Import declarations, sorted and without duplicates, since the
     /// formatter reorders and deduplicates them.
@@ -19,6 +24,7 @@ struct Fingerprint {
 }
 
 fn fingerprint(text: &str) -> Fingerprint {
+    let runs = strings::run_tokens(&parse(text).syntax());
     let (tokens, _) = lex(text);
     let mut fingerprint = Fingerprint {
         tokens: Vec::new(),
@@ -27,13 +33,27 @@ fn fingerprint(text: &str) -> Fingerprint {
     };
     let mut import: Option<String> = None;
     let mut offset = 0;
+    // The end of the run of string literals being skipped.
+    let mut run_end = 0;
     for token in tokens {
         let len = u32::from(token.len) as usize;
         let token_text = &text[offset..offset + len];
+        let start = offset;
         offset += len;
         match token.kind {
             SyntaxKind::WHITESPACE => {}
             kind if kind.is_comment() => comment_words(token_text, &mut fingerprint.comments),
+            _ if start < run_end => {}
+            SyntaxKind::STRING_LITERAL if import.is_none() => {
+                let at = TextSize::try_from(start).unwrap_or_default();
+                match runs.get(&at) {
+                    Some((end, run)) => {
+                        run_end = usize::from(*end);
+                        fingerprint.tokens.push(run.clone());
+                    }
+                    None => fingerprint.tokens.push(token_text.to_string()),
+                }
+            }
             // `import` is a reserved word: it only ever starts an import.
             SyntaxKind::IMPORT_KW => import = Some(String::new()),
             SyntaxKind::SEMI if import.is_some() => fingerprint.imports.extend(import.take()),
@@ -166,6 +186,32 @@ mod tests {
     }
 
     #[test]
+    fn split_strings_are_fine() {
+        assert!(
+            check(
+                r#"class A { String s = "ab cd"; }"#,
+                r#"class A { String s = "ab" + " cd"; }"#
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                r#"class A { String s = "a" + "b" + x + "c"; }"#,
+                r#"class A { String s = "ab" + x + "c"; }"#
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                r#"class A { Object o = f("ab cd"); }"#,
+                r#"class A { Object o = f("ab"
+            + " cd"); }"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn content_changes_are_caught() {
         assert!(check("class A { int x; }", "class A { int y; }").is_err());
         assert!(check("class A { int x; }", "class A { int x }").is_err());
@@ -179,5 +225,29 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn string_changes_are_caught() {
+        let fails = |before: &str, after: &str| {
+            check(
+                &format!("class A {{ Object o = {before}; }}"),
+                &format!("class A {{ Object o = {after}; }}"),
+            )
+            .is_err()
+        };
+        assert!(fails(r#""ab""#, r#""ba""#));
+        assert!(!fails(r#""ab""#, r#""a" + "b""#));
+        // The joined text must be the same, not only the value.
+        assert!(fails(r#""\u0041""#, r#""A""#));
+        // Joining escapes changes the value.
+        assert!(fails(r#""\1" + "2""#, r#""\12""#));
+        // A receiver or a cast's operand cannot be split.
+        assert!(fails(r#""ab".length()"#, r#""a" + "b".length()"#));
+        assert!(fails(r#"(Object) "ab""#, r#"(Object) "a" + "b""#));
+        // Nor joined across another operand or operator.
+        assert!(fails(r#""a" + x + "b""#, r#""ab" + x"#));
+        assert!(fails(r#"x - "a" + "b""#, r#"x - "ab""#));
+        assert!(fails(r#""a" + ("b")"#, r#""ab""#));
     }
 }
