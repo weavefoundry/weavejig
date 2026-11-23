@@ -161,3 +161,31 @@ pub fn prev_significant_token(token: &SyntaxToken) -> Option<SyntaxToken> {
     }
     Some(prev)
 }
+
+/// Modifier keywords in the order the Java Language Specification suggests
+/// (§8.1.1, §8.3.1, §8.4.3), which is also the order google-java-format and
+/// Checkstyle use.
+pub const MODIFIER_ORDER: [&str; 14] = [
+    "public",
+    "protected",
+    "private",
+    "abstract",
+    "default",
+    "static",
+    "sealed",
+    "non-sealed",
+    "final",
+    "transient",
+    "volatile",
+    "synchronized",
+    "native",
+    "strictfp",
+];
+
+/// Where `keyword` comes in [`MODIFIER_ORDER`]; anything else sorts last.
+pub fn modifier_rank(keyword: &str) -> usize {
+    MODIFIER_ORDER
+        .iter()
+        .position(|k| *k == keyword)
+        .unwrap_or(MODIFIER_ORDER.len())
+}
