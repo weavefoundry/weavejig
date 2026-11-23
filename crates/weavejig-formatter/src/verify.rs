@@ -1,9 +1,13 @@
 //! The safety net: formatted output must be the input with different
-//! whitespace, and nothing else.
+//! whitespace, and nothing else, apart from the few rewrites
+//! google-java-format makes: imports sorted and unused ones removed,
+//! modifier keywords reordered, and long strings split.
 
-use weavejig_syntax::{SyntaxKind, TextSize, lex, parse};
+use std::collections::HashMap;
 
-use crate::strings;
+use weavejig_syntax::{SyntaxKind, SyntaxNode, TextSize, lex, parse};
+
+use crate::{imports, modifiers, strings};
 
 /// What a source file says, ignoring layout.
 #[derive(Debug, PartialEq, Eq)]
@@ -11,7 +15,9 @@ struct Fingerprint {
     /// Every token outside import declarations, in order, except that each
     /// run of string literals joined by `+` counts as one token: long
     /// strings are split and their pieces merged again, which leaves the
-    /// literals' joined text, and so the string's value, as it was.
+    /// literals' joined text, and so the string's value, as it was. Each
+    /// run of modifier keywords with no annotation between them counts as
+    /// one token, too, listing them alphabetically, since they are sorted.
     tokens: Vec<String>,
     /// Import declarations, sorted and without duplicates, since the
     /// formatter reorders and deduplicates them.
@@ -23,8 +29,25 @@ struct Fingerprint {
     comments: Vec<char>,
 }
 
+/// The runs of modifier keywords, by start offset: where each ends, and its
+/// keywords in alphabetical order.
+fn modifier_runs(root: &SyntaxNode) -> HashMap<TextSize, (TextSize, String)> {
+    modifiers::runs(root)
+        .into_iter()
+        .filter_map(|run| {
+            let start = run.first()?.range.start();
+            let end = run.last()?.range.end();
+            let mut keywords: Vec<String> = run.into_iter().map(|keyword| keyword.text).collect();
+            keywords.sort();
+            Some((start, (end, keywords.join(" "))))
+        })
+        .collect()
+}
+
 fn fingerprint(text: &str) -> Fingerprint {
-    let runs = strings::run_tokens(&parse(text).syntax());
+    let root = parse(text).syntax();
+    let runs = strings::run_tokens(&root);
+    let modifier_runs = modifier_runs(&root);
     let (tokens, _) = lex(text);
     let mut fingerprint = Fingerprint {
         tokens: Vec::new(),
@@ -33,7 +56,7 @@ fn fingerprint(text: &str) -> Fingerprint {
     };
     let mut import: Option<String> = None;
     let mut offset = 0;
-    // The end of the run of string literals being skipped.
+    // The end of the run of string literals or modifiers being skipped.
     let mut run_end = 0;
     for token in tokens {
         let len = u32::from(token.len) as usize;
@@ -44,6 +67,12 @@ fn fingerprint(text: &str) -> Fingerprint {
             SyntaxKind::WHITESPACE => {}
             kind if kind.is_comment() => comment_words(token_text, &mut fingerprint.comments),
             _ if start < run_end => {}
+            _ if modifier_runs.contains_key(&TextSize::try_from(start).unwrap_or_default()) => {
+                let at = TextSize::try_from(start).unwrap_or_default();
+                let (end, keywords) = &modifier_runs[&at];
+                run_end = usize::from(*end);
+                fingerprint.tokens.push(keywords.clone());
+            }
             SyntaxKind::STRING_LITERAL if import.is_none() => {
                 let at = TextSize::try_from(start).unwrap_or_default();
                 match runs.get(&at) {
@@ -148,9 +177,7 @@ pub(crate) fn check(original: &str, formatted: &str) -> Result<(), String> {
             show(&after.tokens)
         ));
     }
-    if before.imports != after.imports {
-        return Err("imports would change".to_string());
-    }
+    check_imports(&before.imports, &after.imports, formatted)?;
     if before.comments != after.comments {
         return Err("comments would change".to_string());
     }
@@ -158,6 +185,42 @@ pub(crate) fn check(original: &str, formatted: &str) -> Result<(), String> {
     // or pulled apart (`> >` is not `>>`).
     if !parse(formatted).is_ok() {
         return Err("output would not parse".to_string());
+    }
+    Ok(())
+}
+
+/// Checks that the imports of the formatted file are those of the original,
+/// except for imports that are unused in the formatted file, or that do
+/// nothing, which may be removed. A wildcard import must stay.
+fn check_imports(before: &[String], after: &[String], formatted: &str) -> Result<(), String> {
+    if after.iter().any(|import| !before.contains(import)) {
+        return Err("imports would change".to_string());
+    }
+    let removed: Vec<&String> = before
+        .iter()
+        .filter(|import| !after.contains(import))
+        .collect();
+    if removed.is_empty() {
+        return Ok(());
+    }
+    let root = parse(formatted).syntax();
+    let used = imports::code_names(&root);
+    let package = imports::package_name(&root);
+    for import in removed {
+        // `static a . B . c ` or `a . B `, as the fingerprint keeps them.
+        let mut parts: Vec<&str> = import.split_whitespace().collect();
+        let is_static = parts.first() == Some(&"static");
+        if is_static {
+            parts.remove(0);
+        }
+        let name: String = parts.concat();
+        let simple = parts.last().copied().unwrap_or_default();
+        if simple == "*" {
+            return Err(format!("import `{name}` would be removed"));
+        }
+        if used.contains(simple) && !imports::is_redundant(is_static, &name, package.as_deref()) {
+            return Err(format!("import `{name}` would be removed, but is used"));
+        }
     }
     Ok(())
 }
@@ -217,11 +280,81 @@ mod tests {
         assert!(check("class A { int x; }", "class A { int x }").is_err());
         assert!(check("class A { int x; }", "class A { int x; ; }").is_err());
         assert!(check("class A { /* a */ }", "class A {}").is_err());
-        assert!(check("import a.A; class C {}", "class C {}").is_err());
+        assert!(check("import a.A; class C { A a; }", "class C { A a; }").is_err());
+        assert!(check("import a.*; class C {}", "class C {}").is_err());
+        assert!(check("import a.A; class C {}", "import b.A; class C {}").is_err());
         assert!(
             check(
                 "class A { int x = a >> b; }",
                 "class A { int x = a > > b; }"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unused_imports_may_go() {
+        assert!(check("import a.A; class C {}", "class C {}").is_ok());
+        assert!(check("import static a.B.c; class C {}", "class C {}").is_ok());
+        assert!(
+            check(
+                "import a.A; class C { int x = y.A; }",
+                "class C { int x = y.A; }"
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "package p; import java.lang.String; import p.D; class C { String s; D d; }",
+                "package p; class C { String s; D d; }"
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "import static a.B.c; class C { int x = c(); }",
+                "class C { int x = c(); }"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn modifier_order_may_change() {
+        assert!(
+            check(
+                "class A { final static public int X = 1; }",
+                "class A { public static final int X = 1; }"
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "class A { final /* c */ static int X; }",
+                "class A { static /* c */ final int X; }"
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "non-sealed static class A {}",
+                "static non-sealed class A {}"
+            )
+            .is_ok()
+        );
+        // Keywords stay on their side of an annotation.
+        assert!(
+            check(
+                "class A { static @D final int X; }",
+                "class A { static final @D int X; }"
+            )
+            .is_err()
+        );
+        assert!(check("class A { static int X; }", "class A { final int X; }").is_err());
+        assert!(
+            check(
+                "class A { static final int X; }",
+                "class A { static static int X; }"
             )
             .is_err()
         );

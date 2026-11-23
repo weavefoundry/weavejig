@@ -163,9 +163,99 @@ class C {
 fn imports_are_sorted_static_first() {
     assert_eq!(
         fmt(
-            "import b.B;\nimport static z.Z.z;\nimport a.A;\nimport a.A;\nimport static a.A.*;\nclass C {}"
+            "import b.B;\nimport static z.Z.z;\nimport a.A;\nimport a.A;\nimport static a.A.*;\nclass C {A a; B b; int x = z;}"
         ),
-        "import static a.A.*;\nimport static z.Z.z;\n\nimport a.A;\nimport b.B;\n\nclass C {}\n"
+        "import static a.A.*;\nimport static z.Z.z;\n\nimport a.A;\nimport b.B;\n\nclass C {\n  A a;\n  B b;\n  int x = z;\n}\n"
+    );
+}
+
+#[test]
+fn unused_imports_are_removed() {
+    assert_eq!(
+        fmt("package p;\n\n\
+             import a.Unused;\n\
+             import a.Used;\n\
+             import a.Member;\n\
+             import a.Declared;\n\
+             import a.Linked;\n\
+             import a.Thrown;\n\
+             import a.Param;\n\
+             import a.Code;\n\
+             import a.Local;\n\
+             import java.lang.String;\n\
+             import p.Same;\n\
+             import java.util.*;\n\
+             import static a.S.used;\n\
+             import static a.S.unused;\n\n\
+             /**\n * {@link Linked} {@link Foo#bar(Param, int)} {@code Code}\n *\n * @throws Thrown\n */\n\
+             class C {\n  Used u;\n  int Declared;\n  Object o = x.Member;\n  String s;\n  Same t;\n\
+             void f() {\n    /** {@link Local} */\n    int z = used();\n  }\n}\n"),
+        "package p;\n\n\
+         import static a.S.used;\n\n\
+         import a.Linked;\n\
+         import a.Param;\n\
+         import a.Thrown;\n\
+         import a.Used;\n\
+         import java.util.*;\n\n\
+         /**\n * {@link Linked} {@link Foo#bar(Param, int)} {@code Code}\n *\n * @throws Thrown\n */\n\
+         class C {\n  Used u;\n  int Declared;\n  Object o = x.Member;\n  String s;\n  Same t;\n\n\
+         \x20 void f() {\n    /** {@link Local} */\n    int z = used();\n  }\n}\n"
+    );
+    assert_eq!(
+        fmt("package p;\n\nimport a.A;\nimport b.B;\n\nclass C {}\n"),
+        "package p;\n\nclass C {}\n"
+    );
+    assert_eq!(fmt("import a.A;\n\nclass C {}\n"), "class C {}\n");
+}
+
+#[test]
+fn comments_travel_with_the_import_above_them() {
+    // A `//` comment on the lines below an import moves with it.
+    assert_eq!(
+        fmt("import c.C;\n// about B\nimport b.B;\nimport a.A;\n\nclass K { A a; B b; C c; }\n"),
+        "import a.A;\nimport b.B;\nimport c.C;\n\n// about B\n\nclass K {\n  A a;\n  B b;\n  C c;\n}\n"
+    );
+    // So does that of a removed import, and a comment on its line.
+    assert_eq!(
+        fmt("import b.B;\nimport x.X; // tail\nimport a.A;\nclass K { A a; B b; }\n"),
+        "import a.A;\nimport b.B;\n\n// tail\n\nclass K {\n  A a;\n  B b;\n}\n"
+    );
+    assert_eq!(
+        fmt("// top\nimport a.Unused; // gone\nimport b.B;\nclass K { B b; }\n"),
+        "// top\n// gone\nimport b.B;\n\nclass K {\n  B b;\n}\n"
+    );
+    // A static import's comments stay above the blank line.
+    assert_eq!(
+        fmt(
+            "import b.B;\nimport static z.Z.z;\n// about a\nimport a.A;\nclass K { A a; B b; int q = z; }\n"
+        ),
+        "import static z.Z.z;\n// about a\n\nimport a.A;\nimport b.B;\n\nclass K {\n  A a;\n  B b;\n  int q = z;\n}\n"
+    );
+}
+
+#[test]
+fn modifiers_are_reordered() {
+    assert_eq!(
+        fmt("class M {\n\
+             final static public int A = 1;\n\
+             static @Deprecated final int B = 2;\n\
+             final /* c */ static int E = 5;\n\
+             static final @A volatile transient int x;\n\
+             synchronized public static void f() {}\n\
+             final static sealed class R {}\n\
+             non-sealed static public class Y extends R {}\n\
+             static protected abstract void g();\n\
+             }\n"),
+        "class M {\n\
+         \x20 public static final int A = 1;\n\
+         \x20 static @Deprecated final int B = 2;\n\
+         \x20 static /* c */ final int E = 5;\n\
+         \x20 static final @A transient volatile int x;\n\n\
+         \x20 public static synchronized void f() {}\n\n\
+         \x20 static sealed final class R {}\n\n\
+         \x20 public static non-sealed class Y extends R {}\n\n\
+         \x20 protected abstract static void g();\n\
+         }\n"
     );
 }
 

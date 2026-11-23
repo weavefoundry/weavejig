@@ -1,4 +1,6 @@
-use weavejig_syntax::{SyntaxKind::*, SyntaxNode, TextRange, significant_children};
+use weavejig_syntax::{
+    SyntaxKind::*, SyntaxNode, TextRange, modifier_rank as rank, significant_children,
+};
 
 use crate::{Diagnostic, Edit, Fix, Rule, RuleMeta};
 
@@ -13,24 +15,6 @@ static META: RuleMeta = RuleMeta {
     pmd: None,
     fixable: true,
 };
-
-/// JLS §8.1.1, §8.3.1 and §8.4.3.
-const ORDER: &[&str] = &[
-    "public",
-    "protected",
-    "private",
-    "abstract",
-    "default",
-    "static",
-    "sealed",
-    "non-sealed",
-    "final",
-    "transient",
-    "volatile",
-    "synchronized",
-    "native",
-    "strictfp",
-];
 
 struct Modifier {
     /// The keyword, or `None` for an annotation.
@@ -65,13 +49,6 @@ fn modifiers(node: &SyntaxNode) -> Vec<Modifier> {
         }
     }
     out
-}
-
-fn rank(keyword: &str) -> usize {
-    ORDER
-        .iter()
-        .position(|k| *k == keyword)
-        .unwrap_or(ORDER.len())
 }
 
 impl Rule for ModifierOrder {

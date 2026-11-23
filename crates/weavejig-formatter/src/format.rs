@@ -19,6 +19,7 @@ use crate::doc::{
     Doc, Tag, concat, fill_break, group, group_if, indent, indent_if, next_line_if_fits, space,
     tagged_group, text,
 };
+use crate::imports::import_name;
 use crate::spacing::space_between;
 
 pub(crate) struct Formatter<'a> {
@@ -43,20 +44,6 @@ const TYPE_ANNOTATIONS: [&str; 4] = [
     "org.checkerframework.checker.nullness.qual.Nullable",
     "org.checkerframework.checker.nullness.qual.NonNull",
 ];
-
-/// The dotted name an import declaration names, and whether it is static.
-fn import_name(import: &SyntaxNode) -> (bool, String) {
-    let mut is_static = false;
-    let mut name = String::new();
-    for element in significant_children(import) {
-        match element.kind() {
-            IMPORT_KW | SEMI => {}
-            STATIC_KW => is_static = true,
-            _ => name.push_str(&element.to_string()),
-        }
-    }
-    (is_static, name.split_whitespace().collect())
-}
 
 fn has_arguments(annotation: &SyntaxElement) -> bool {
     annotation
@@ -445,13 +432,30 @@ impl<'a> Formatter<'a> {
         let mut previous_static = None;
         for (non_static, _, import) in entries {
             let changed_block = previous_static.is_some_and(|previous| previous != non_static);
-            docs.push(if changed_block {
-                Doc::BlankLine
-            } else {
-                Doc::HardLine
-            });
-            docs.push(self.generic(import));
             previous_static = Some(non_static);
+            if !changed_block {
+                docs.push(Doc::HardLine);
+                docs.push(self.generic(import));
+                continue;
+            }
+            // Comments between imports belong to the import above them (see
+            // `imports`), so those before the first non-static import stay
+            // with the static ones, above the blank line.
+            let start = first_token(import).map(|token| token.text_range().start());
+            if let Some(start) = start.filter(|start| self.skip_leading.get() != Some(*start))
+                && let Some(trivia) = self.comments.of(start)
+                && !trivia.leading.is_empty()
+            {
+                docs.push(Doc::HardLine);
+                self.leading_comments(trivia, Some(IMPORT_KW), &mut docs);
+                docs.push(Doc::BlankLine);
+                let previous = self.skip_leading.replace(Some(start));
+                docs.push(self.generic(import));
+                self.skip_leading.set(previous);
+                continue;
+            }
+            docs.push(Doc::BlankLine);
+            docs.push(self.generic(import));
         }
         self.skip_leading.set(None);
         concat(docs)
