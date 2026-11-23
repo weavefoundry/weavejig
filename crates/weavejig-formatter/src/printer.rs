@@ -75,7 +75,7 @@ pub(crate) fn print(doc: &Doc, line_width: usize) -> String {
     while let Some((indent, flat, doc)) = stack.pop() {
         let whole = doc;
         match doc {
-            Doc::Text(text) | Doc::Suffix(text) => out.write(text),
+            Doc::Text(text) => out.write(text),
             Doc::Space => out.space(),
             // A line break that a comment already forced takes the place of
             // this one, at this one's indentation.
@@ -114,7 +114,9 @@ pub(crate) fn print(doc: &Doc, line_width: usize) -> String {
                     out.write(line);
                 }
             }
-            Doc::LineComment(comment) => {
+            // A trailing comment that runs past the line width continues on
+            // `//` lines of its own, lined up under where it starts.
+            Doc::LineComment(comment) | Doc::Suffix(comment) => {
                 let column = if out.pending > 0 {
                     out.pending_indent
                 } else {
@@ -425,6 +427,19 @@ mod tests {
         );
         assert_eq!(print(&doc, 12), "{\n  // one two\n  // three\n");
         assert_eq!(print(&doc, 80), "{\n  // one two three\n");
+    }
+
+    #[test]
+    fn long_trailing_comments_wrap_under_their_start() {
+        let doc = concat(vec![
+            text("a;"),
+            Doc::Space,
+            Doc::Suffix("// one two three".to_string()),
+            Doc::CommentBreak,
+            text("b;"),
+        ]);
+        assert_eq!(print(&doc, 14), "a; // one two\n   // three\nb;\n");
+        assert_eq!(print(&doc, 80), "a; // one two three\nb;\n");
     }
 
     #[test]
