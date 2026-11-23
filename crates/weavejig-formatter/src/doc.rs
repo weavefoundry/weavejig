@@ -19,6 +19,11 @@ pub(crate) enum Doc {
     SoftLine,
     /// Always a line break. Several in a row still produce only one.
     HardLine,
+    /// The line break that ends a trailing `//` comment. It forces nothing
+    /// to break where it is written: [`place_comment_breaks`] moves it out
+    /// of every document that it ends, and only what still encloses it
+    /// then is broken.
+    CommentBreak,
     /// Always a line break, preceded by exactly one empty line.
     BlankLine,
     /// The `bool` on the next three caches [`Doc::forces_break`].
@@ -64,7 +69,7 @@ impl Doc {
     pub(crate) fn forces_break(&self) -> bool {
         match self {
             Doc::Text(text) => text.contains('\n'),
-            Doc::Suffix(_) | Doc::Space | Doc::Line | Doc::SoftLine => false,
+            Doc::Suffix(_) | Doc::Space | Doc::Line | Doc::SoftLine | Doc::CommentBreak => false,
             Doc::HardLine | Doc::BlankLine => true,
             Doc::Concat(_, forced)
             | Doc::Indent(_, _, forced)
@@ -89,7 +94,7 @@ impl Doc {
                 text.chars().count()
             }
             Doc::Space | Doc::Line => 1,
-            Doc::SoftLine | Doc::HardLine | Doc::BlankLine => 0,
+            Doc::SoftLine | Doc::HardLine | Doc::BlankLine | Doc::CommentBreak => 0,
             Doc::Concat(docs, _) => docs.iter().map(Doc::flat_width).sum(),
             Doc::Indent(_, doc, _)
             | Doc::Group(doc, _)
@@ -148,6 +153,102 @@ pub(crate) fn next_line_if_fits(columns: u16, doc: Doc) -> Doc {
 pub(crate) fn fill_break(doc: Doc) -> Doc {
     let forced = doc.forces_break();
     Doc::FillBreak(Box::new(doc), forced)
+}
+
+/// Turns every [`Doc::CommentBreak`] into a [`Doc::HardLine`], placed after
+/// the documents it ends: a comment that trails the last token of a group
+/// breaks the line after the group, so the group itself may stay flat.
+///
+/// google-java-format does the same: `a.b().c(x) // why` followed by
+/// `&& d` breaks before the `&&`, but not the chain, whose last token the
+/// comment trails. The `HardLine` lands where the document that follows the
+/// comment starts, and forces what encloses it there to break.
+pub(crate) fn place_comment_breaks(mut doc: Doc) -> Doc {
+    if hoist_comment_break(&mut doc) {
+        doc = concat(vec![doc, Doc::HardLine]);
+    }
+    doc
+}
+
+/// Places the comment breaks inside `doc`, except one that ends it: that one
+/// is removed and reported, for the caller to place after `doc`. Updates
+/// the cached [`Doc::forces_break`] of everything it changes.
+fn hoist_comment_break(doc: &mut Doc) -> bool {
+    match doc {
+        Doc::CommentBreak => {
+            *doc = Doc::Concat(Vec::new(), false);
+            true
+        }
+        Doc::Concat(docs, forced) => {
+            let mut pending = false;
+            let mut i = 0;
+            while i < docs.len() {
+                let ends = hoist_comment_break(&mut docs[i]);
+                if pending && !is_empty(&docs[i]) {
+                    docs.insert(i, Doc::HardLine);
+                    i += 1;
+                    pending = false;
+                }
+                pending |= ends;
+                i += 1;
+            }
+            *forced = docs.iter().any(Doc::forces_break);
+            pending
+        }
+        Doc::Indent(_, inner, forced)
+        | Doc::Group(inner, forced)
+        | Doc::TaggedGroup(_, inner, forced)
+        | Doc::IndentIf(_, _, inner, forced)
+        | Doc::GroupIf(_, inner, forced)
+        | Doc::FillBreak(inner, forced)
+        | Doc::NextLineIfFits(_, inner, forced) => {
+            let ends = hoist_comment_break(inner);
+            *forced = inner.forces_break();
+            ends
+        }
+        Doc::Text(_)
+        | Doc::Suffix(_)
+        | Doc::Space
+        | Doc::Line
+        | Doc::SoftLine
+        | Doc::HardLine
+        | Doc::BlankLine
+        | Doc::LineComment(_)
+        | Doc::Javadoc(_) => false,
+    }
+}
+
+/// Whether `doc` prints nothing at all, not even a space.
+fn is_empty(doc: &Doc) -> bool {
+    match doc {
+        Doc::Text(text) => text.is_empty(),
+        Doc::Concat(docs, _) => docs.iter().all(is_empty),
+        Doc::Indent(_, inner, _)
+        | Doc::Group(inner, _)
+        | Doc::TaggedGroup(_, inner, _)
+        | Doc::IndentIf(_, _, inner, _)
+        | Doc::GroupIf(_, inner, _) => is_empty(inner),
+        _ => false,
+    }
+}
+
+impl Doc {
+    /// Whether the document contains the line break after a trailing `//`
+    /// comment that [`place_comment_breaks`] has not placed yet.
+    pub(crate) fn has_comment_break(&self) -> bool {
+        match self {
+            Doc::CommentBreak => true,
+            Doc::Concat(docs, _) => docs.iter().any(Doc::has_comment_break),
+            Doc::Indent(_, inner, _)
+            | Doc::Group(inner, _)
+            | Doc::TaggedGroup(_, inner, _)
+            | Doc::IndentIf(_, _, inner, _)
+            | Doc::GroupIf(_, inner, _)
+            | Doc::FillBreak(inner, _)
+            | Doc::NextLineIfFits(_, inner, _) => inner.has_comment_break(),
+            _ => false,
+        }
+    }
 }
 
 /// `items` separated by `separator` followed by a `Line`.

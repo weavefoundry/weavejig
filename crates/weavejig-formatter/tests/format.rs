@@ -371,8 +371,12 @@ fn empty_and_comment_only_files() {
 
 #[test]
 fn long_chains_do_not_overflow_the_stack() {
-    let sum = format!("class C {{ int x = 1{}; }}", " + 1".repeat(3_000));
+    // Operands of ten characters or more take a line each.
+    let sum = format!("class C {{ int x = 1{}; }}", " + longer_name".repeat(3_000));
     assert!(fmt(&sum).lines().count() > 3_000);
+    // Short operands fill lines.
+    let sum = format!("class C {{ int x = 1{}; }}", " + 1".repeat(3_000));
+    assert!(fmt(&sum).lines().count() > 100);
     let calls = format!("class C {{ Object x = a{}; }}", ".b()".repeat(3_000));
     assert!(fmt(&calls).lines().count() > 3_000);
 }

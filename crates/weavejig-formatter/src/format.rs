@@ -199,7 +199,7 @@ impl<'a> Formatter<'a> {
             docs.push(space());
             docs.push(comment_doc(comment, true));
             if comment.is_line {
-                docs.push(Doc::HardLine);
+                docs.push(Doc::CommentBreak);
             }
         }
         concat(docs)
@@ -831,6 +831,7 @@ impl<'a> Formatter<'a> {
             .count();
         let indent = depth * self.block_indent() as usize;
         declaration.forces_break()
+            || declaration.has_comment_break()
             || indent + declaration.flat_width() + semi.flat_width()
                 > crate::FormatOptions::LINE_WIDTH
     }
@@ -1166,6 +1167,16 @@ impl<'a> Formatter<'a> {
         if statement.kind() == BLOCK {
             return concat(vec![space(), self.element(statement)]);
         }
+        // `if (ready) // why`: google-java-format starts the statement on
+        // the next line, at the `if`'s own indentation. The comment's line
+        // break comes before the body, so the body is not indented.
+        let after_comment = first_of(statement)
+            .and_then(|first| weavejig_syntax::prev_significant_token(&first))
+            .and_then(|previous| self.trivia(&previous))
+            .is_some_and(|trivia| trivia.trailing.iter().any(|comment| comment.is_line));
+        if after_comment {
+            return self.element(statement);
+        }
         group(indent(
             self.block_indent(),
             concat(vec![Doc::Line, self.element(statement)]),
@@ -1377,13 +1388,25 @@ impl<'a> Formatter<'a> {
                 break left;
             }
         };
+        // As google-java-format does, operands that are all short fill
+        // lines, `a + b + c` wrapping only where the next one does not fit.
+        // Otherwise a wrapped expression breaks before every operator.
+        let fills = self.is_short(&[NodeOrToken::Node(first.clone())])
+            && tail
+                .iter()
+                .all(|(_, operand)| self.is_short(std::slice::from_ref(operand)));
         let mut rest = Vec::new();
         for (operator, operand) in tail.iter().rev() {
-            rest.push(Doc::Line);
             // A shift is several adjacent `>` tokens.
-            rest.extend(operator.iter().map(|token| self.element(token)));
-            rest.push(space());
-            rest.push(self.element(operand));
+            let mut item: Vec<Doc> = operator.iter().map(|token| self.element(token)).collect();
+            item.push(space());
+            item.push(self.element(operand));
+            if fills {
+                rest.push(fill_break(concat(item)));
+            } else {
+                rest.push(Doc::Line);
+                rest.extend(item);
+            }
         }
         // The first operand is indented too: if it wraps, its lines sit to
         // the right of the operators that follow it.
@@ -1611,10 +1634,13 @@ impl<'a> Formatter<'a> {
             };
             before.insert(0, Doc::SoftLine);
             before.push(inner);
+            // The `)` is inside the indentation, as in google-java-format:
+            // after `f(a, b // why`, it starts a line indented like `a`. And
+            // since the group encloses it, that line break breaks the group.
+            before.push(self.element(close));
             concat(vec![
                 self.element(open),
                 group(indent(continuation, concat(before))),
-                self.element(close),
             ])
         };
         // `@A(x = {1, 2}, y = 3)`: several named values, one of them an
@@ -1691,10 +1717,12 @@ impl<'a> Formatter<'a> {
                 inner.push(if i % 2 == 0 { Doc::HardLine } else { space() });
                 inner.push(self.spaced(argument));
             }
+            // As in `wrapped`, the `)` is indented like the arguments if a
+            // trailing comment puts it on a line of its own.
+            inner.push(self.element(close));
             return Some(concat(vec![
                 self.element(open),
                 indent(continuation, concat(inner)),
-                self.element(close),
             ]));
         }
         if self.fills(&arguments) {
