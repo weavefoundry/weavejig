@@ -354,6 +354,10 @@ fn rules_are_selected_and_configured() {
     assert!(text.contains("A.java:2:13: magic-number: "), "{text}");
     assert!(!text.contains("A.java:3"), "{text}");
 
+    // `--select` runs only what it names, not the file's `extend-select`.
+    let output = weavejig(&dir, &["check", "--select", "upper-ell"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+
     // `--extend-select` replaces the file's `extend-select`.
     let output = weavejig(&dir, &["check", "--extend-select", "todo-comment"]);
     assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));

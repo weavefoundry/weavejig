@@ -25,10 +25,19 @@ static META: RuleMeta = RuleMeta::new(
 fn is_zero(literal: &str) -> bool {
     let text = literal.to_ascii_lowercase().replace('_', "");
     let digits = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0b")) {
-        Some(digits) => digits.split('p').next().unwrap_or(digits),
-        None => text.split('e').next().unwrap_or(&text),
+        // In a hexadecimal literal `f` and `d` are digits. Only `l` is a
+        // suffix there; a floating-point one has its suffix after the `p`.
+        Some(digits) => digits
+            .split('p')
+            .next()
+            .unwrap_or(digits)
+            .trim_end_matches('l'),
+        None => text
+            .split('e')
+            .next()
+            .unwrap_or(&text)
+            .trim_end_matches(['l', 'f', 'd']),
     };
-    let digits = digits.trim_end_matches(['l', 'f', 'd']);
     !digits.is_empty() && digits.chars().all(|c| c == '0' || c == '.')
 }
 
@@ -109,10 +118,15 @@ mod tests {
     fn zeros() {
         for zero in [
             "0", "0L", "00", "0x0", "0x00L", "0.0", "0f", "0.0d", "0e5", "0_0", "0b0", ".0",
+            "0x0p0", "0x0.0p0f", "0X0P0D",
         ] {
             assert!(is_zero(zero), "{zero}");
         }
-        for other in ["1", "0x10", "0.1", "10", "0xf", "1e0", "0b1", "08"] {
+        // `f` and `d` are digits of a hexadecimal literal, not suffixes.
+        for other in [
+            "1", "0x10", "0.1", "10", "0xf", "1e0", "0b1", "08", "0x0f", "0x0FF", "0x0d", "0x0dL",
+            "0x0fp0",
+        ] {
             assert!(!is_zero(other), "{other}");
         }
     }

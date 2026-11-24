@@ -43,7 +43,7 @@ Early development. Everything below runs, but nothing is at parity yet: do not r
 |---|---|
 | Parser | Hand-written, lossless, error-tolerant, written for the Java 21 grammar. Agrees with `javac` on 6,636 of 6,640 dev-corpus files and on 2,548 of 2,549 held-out files. The 4 dev disagreements are JUnit tests that use unnamed variables (`_`), which are Java 22: `javac` 21 rejects them. |
 | Formatter | Formats whole files in google-java-format style, Javadoc included. 94.1% of dev-corpus files (6,247 of 6,636) come out identical to google-java-format 2.0.0, and 81.4% of held-out files (2,075 of 2,549). Most of the rules were tuned on guava, gson and commons-lang, where 97.7% match; jsoup, zxing and JUnit were added to the dev corpus later and match less well. As google-java-format does, long string literals are split at word boundaries, long trailing `//` comments continue on lines under their start, modifiers are put in JLS order, and unused imports are removed. Not done: a tail of rarer wrapping and comment-placement cases differs. |
-| Linter | 71 rules, 11 with fixes; 46 run by default and the rest are opt-in. 69 mirror Checkstyle checks: with default options their diagnostics match Checkstyle on 177,933 of 177,946 in the dev corpus and on 55,979 of 55,999 in the held-out corpus. 10 mirror PMD rules, matching on 13,071 of 13,091 and 4,618 of 4,650. Rules take options, and diagnostics can be suppressed in the source. Coverage: setting aside layout checks, which the formatter replaces, the rules account for 84% of what Checkstyle's `sun_checks` reports on the dev corpus and 79% of what `google_checks` reports (83% and 33% on the held-out corpus); nearly all of the rest is Checkstyle's Javadoc checks, which have no rules yet. Not done: Javadoc rules, most of PMD, and anything that needs types. |
+| Linter | 71 rules, 11 with fixes; 46 run by default and the rest are opt-in. 69 mirror Checkstyle checks: with default options their diagnostics match Checkstyle on 177,933 of 177,946 in the dev corpus and on 55,979 of 55,999 in the held-out corpus. 10 mirror PMD rules, matching on 13,071 of 13,091 and 4,618 of 4,650. Rules take options, and diagnostics can be suppressed in the source. Coverage: setting aside layout checks, which the formatter replaces, the rules account for 84% of what Checkstyle's `sun_checks` reports on the dev corpus and 79% of what `google_checks` reports (83% and 36% on the held-out corpus); nearly all of the rest is Checkstyle's Javadoc checks, which have no rules yet. Not done: Javadoc rules, most of PMD, and anything that needs types. |
 | CLI | `check`, `format`, `rules`; text and JSON output; `weavejig.toml`, with rule selection, rule options and per-file ignores. |
 | Scoring | `cargo xtask score` for the parser (`javac`), formatter (google-java-format) and linter (Checkstyle and PMD), rule by rule, with coverage against Checkstyle's bundled configurations. |
 
@@ -114,7 +114,7 @@ int port() {
 }
 ```
 
-- A `weavejig-ignore` comment after code covers its line; on a line of its own, the next line. Without rule ids it covers every rule.
+- A comment that starts with `weavejig-ignore` covers its line if it comes after code; on a line of its own, the next line. Without rule ids it covers every rule.
 - `// weavejig-ignore-file: rule-id` covers the whole file.
 - `@SuppressWarnings("weavejig:rule-id")` covers the declaration it is on; `"weavejig"` and `"all"` cover every rule.
 

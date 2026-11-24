@@ -18,6 +18,7 @@ public class Members {
   Integer boxed = null;
   int one = 1;
   int hex = 0x0;
+  int mask = 0x0f;
   final int constant = 0;
   static int shared = 0;
   int negative = -0;

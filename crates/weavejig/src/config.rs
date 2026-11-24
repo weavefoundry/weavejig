@@ -52,7 +52,8 @@ pub struct LintConfig {
 }
 
 /// What the command line says about rule selection. Each part replaces the
-/// configuration file's when given.
+/// configuration file's when given, and `select` replaces the file's
+/// `extend-select` as well.
 #[derive(Debug, Default)]
 pub struct SelectionOverrides<'a> {
     pub select: &'a [String],
@@ -73,7 +74,7 @@ impl PerFileIgnores {
         if self.entries.is_empty() {
             return Vec::new();
         }
-        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let absolute = crate::files::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         let relative = absolute.strip_prefix(&self.root).unwrap_or(&absolute);
         self.entries
             .iter()
@@ -141,7 +142,13 @@ impl Config {
             } else {
                 Some(overrides.select.to_vec())
             },
-            extend_select: or_file(overrides.extend_select, &self.lint.extend_select),
+            // `--select` means these rules and no others, so it replaces
+            // the file's `extend-select` too.
+            extend_select: if overrides.select.is_empty() {
+                or_file(overrides.extend_select, &self.lint.extend_select)
+            } else {
+                overrides.extend_select.to_vec()
+            },
             ignore: or_file(overrides.ignore, &self.lint.ignore),
         };
         let mut rules = RuleSet::new(&selection)?;
@@ -175,7 +182,9 @@ impl Config {
                 .with_context(|| format!("invalid `per-file-ignores` pattern `{pattern}`"))?;
             entries.push((glob.compile_matcher(), rules.clone()));
         }
-        let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+        // With `..` resolved, as the files' paths are, so that the two can
+        // be compared.
+        let root = crate::files::absolute(root).unwrap_or_else(|_| root.to_path_buf());
         Ok(PerFileIgnores { entries, root })
     }
 }
@@ -265,6 +274,30 @@ mod tests {
         assert_eq!(extended.len(), defaults.len() + 1);
         assert!(extended.meta("magic-number").is_some());
 
+        // `--select` runs only what it names: the file's `extend-select`
+        // goes with the file's `select`.
+        let only = |overrides: &SelectionOverrides<'_>| -> Vec<&'static str> {
+            let rules = config.rules(overrides).unwrap();
+            rules.iter().map(|rule| rule.meta().id).collect()
+        };
+        let select = ["upper-ell".to_string()];
+        let extend = ["need-braces".to_string()];
+        assert_eq!(
+            only(&SelectionOverrides {
+                select: &select,
+                ..SelectionOverrides::default()
+            }),
+            ["upper-ell"]
+        );
+        assert_eq!(
+            only(&SelectionOverrides {
+                select: &select,
+                extend_select: &extend,
+                ..SelectionOverrides::default()
+            }),
+            ["need-braces", "upper-ell"]
+        );
+
         let config =
             Config::parse("[lint]\nselect = [\"all\"]\nignore = [\"magic-number\"]").unwrap();
         let all = config.rules(&SelectionOverrides::default()).unwrap();
@@ -328,6 +361,17 @@ mod tests {
             ignores
                 .for_path(Path::new("/repo/src/main/Foo.java"))
                 .is_empty()
+        );
+
+        // `..` in the root or in a path does not stop a glob from matching.
+        let ignores = config.per_file_ignores(Path::new("/repo/sub/..")).unwrap();
+        assert_eq!(
+            ignores.for_path(Path::new("/repo/src/test/java/FooTest.java")),
+            ["magic-number"]
+        );
+        assert_eq!(
+            ignores.for_path(Path::new("/repo/sub/../Top.java")),
+            ["all"]
         );
 
         let config = Config::parse("[lint.per-file-ignores]\n\"**\" = [\"nope\"]").unwrap();

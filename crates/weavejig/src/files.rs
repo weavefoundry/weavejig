@@ -8,7 +8,7 @@ use ignore::overrides::OverrideBuilder;
 
 /// The absolute form of `path`, with `.` and `..` resolved by name alone
 /// (without following symbolic links).
-fn absolute(path: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn absolute(path: &Path) -> std::io::Result<PathBuf> {
     let mut out = PathBuf::new();
     for component in std::path::absolute(path)?.components() {
         match component {

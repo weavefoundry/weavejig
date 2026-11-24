@@ -68,7 +68,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Part of every cache key. Change it when a change to this file makes
 /// reports cached earlier wrong, such as reading a tool's output differently.
-const CACHE_VERSION: &str = "4";
+const CACHE_VERSION: &str = "5";
 
 /// Identifies a run of `tool` with `config` over `sources`.
 fn cache_key(tool: &str, config: &str, sources: &[Source]) -> String {
@@ -361,8 +361,10 @@ fn parse_checkstyle_xml(xml: &str, report: &mut CheckstyleReport) {
         } else if tag.starts_with("exception") {
             report.failed.insert(file.clone());
         } else if tag.starts_with("error ") {
+            // A module that was given an id is `...LeftCurlyCheck#LeftCurlyNl`.
             let source = xml_attribute(tag, "source").unwrap_or_default();
-            let check = source
+            let class = source.split('#').next().unwrap_or(&source);
+            let check = class
                 .rsplit('.')
                 .next()
                 .and_then(|name| name.strip_suffix("Check"));
@@ -908,6 +910,7 @@ mod tests {
 <error line="6" column="33" severity="error" message="Should use uppercase &apos;L&apos;." source="com.puppycrawl.tools.checkstyle.checks.UpperEllCheck"/>
 <error line="11" column="5" severity="error" message="&apos;if&apos; construct must use &apos;{}&apos;s." source="com.puppycrawl.tools.checkstyle.checks.blocks.NeedBracesCheck"/>
 <error line="20" severity="error" message="Javadoc comment at column 8 has parse error. Details: no viable alternative" source="com.puppycrawl.tools.checkstyle.checks.imports.UnusedImportsCheck"/>
+<error line="30" column="3" severity="warning" message="&apos;{&apos; at column 3 should be on the previous line." source="com.puppycrawl.tools.checkstyle.checks.blocks.LeftCurlyCheck#LeftCurlyEol"/>
 </file>
 <file name="/src/B&amp;C.java">
 <error line="1" severity="error" message="IllegalStateException occurred while parsing file /src/B&amp;C.java." source="com.puppycrawl.tools.checkstyle.Checker"/>
@@ -923,6 +926,8 @@ mod tests {
             [
                 ("/src/A.java".to_string(), "UpperEll".to_string(), 6),
                 ("/src/A.java".to_string(), "NeedBraces".to_string(), 11),
+                // By the check's name, whatever id its module has.
+                ("/src/A.java".to_string(), "LeftCurly".to_string(), 30),
             ]
         );
         assert_eq!(report.failed, HashSet::from(["/src/B&C.java".to_string()]));

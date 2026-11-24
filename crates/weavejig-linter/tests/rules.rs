@@ -403,20 +403,26 @@ class C {
   /* weavejig-ignore: upper-ell */
   long m = 13l;
   long n = 14l; // weavejig-ignored: not a marker
+  /** Write {@code // weavejig-ignore} above a line to silence it. */
+  long o = 15l;
+  // note: weavejig-ignore: upper-ell
+  long p = 16l;
 }
 ";
+    // A comment that only mentions the marker, as the last two do, is not
+    // a suppression.
     assert_eq!(
         unsuppressed("upper-ell", SuppressionNames::default(), text),
-        [2, 6, 16, 20, 23]
+        [2, 6, 16, 20, 23, 25, 27]
     );
     // Each tool's spellings can be switched off on their own.
     assert_eq!(
         unsuppressed("upper-ell", SuppressionNames::CHECKSTYLE, text),
-        [2, 3, 5, 6, 8, 11, 16, 20, 22, 23]
+        [2, 3, 5, 6, 8, 11, 16, 20, 22, 23, 25, 27]
     );
     assert_eq!(
         unsuppressed("upper-ell", SuppressionNames::NONE, text).len(),
-        14
+        16
     );
 
     let file = "// weavejig-ignore-file: upper-ell\nclass C {\n  long a = 1l;\n  void m() { if (a > 0) a++; }\n}\n";
@@ -550,6 +556,41 @@ final class C {
     // Parameters of a method without a body are not asked to be final.
     assert!(finals.contains("void m(final int x);"), "{finals}");
     assert!(lines("final-parameters", &finals).is_empty());
+}
+
+#[test]
+fn final_is_not_added_to_a_parameter_the_body_assigns() {
+    let text = "\
+class C {
+  int f(int a, int b, int c, int d) {
+    a = 1;
+    b++;
+    --c;
+    return a + b + c + d;
+  }
+}
+";
+    // All four are reported; only the one left alone can be fixed.
+    assert_eq!(lines("final-parameters", text), [2, 2, 2, 2]);
+    let finals = fixed("final-parameters", text);
+    assert!(
+        finals.contains("int f(int a, int b, int c, final int d)"),
+        "{finals}"
+    );
+}
+
+#[test]
+fn illegal_import_of_a_whole_package() {
+    let text =
+        "import sun.*;\nimport sun.misc.*;\nimport sunny.*;\nimport sun.misc.Unsafe;\nclass C {}\n";
+    assert_eq!(lines("illegal-import", text), [1, 2, 4]);
+}
+
+#[test]
+fn hexadecimal_digits_are_not_suffixes() {
+    let text = "class C {\n  int mask = 0x0f;\n  long wide = 0x0dL;\n  int zero = 0x0;\n}\n";
+    assert_eq!(lines("explicit-initialization", text), [4]);
+    assert!(fixed("explicit-initialization", text).contains("int mask = 0x0f;"));
 }
 
 #[test]

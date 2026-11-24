@@ -6,6 +6,9 @@
 //!   a line of its own, the next line. Without rule ids it covers every rule.
 //! - `// weavejig-ignore-file: rule-id` covers the whole file.
 //!
+//! A `weavejig-ignore` comment must start with those words; one that only
+//! mentions them is an ordinary comment.
+//!
 //! So that code written for Checkstyle or PMD needs no changes, their own
 //! spellings work too, for the rules that mirror their checks:
 //!
@@ -240,10 +243,15 @@ impl Suppressions {
     }
 }
 
-/// What follows `marker` in a comment, if the comment has it.
+/// What follows `marker` in a comment that starts with it. A comment that
+/// only mentions the marker further on, as documentation might, is not a
+/// suppression.
 fn after<'a>(comment: &'a str, marker: &str) -> Option<&'a str> {
-    let at = comment.find(marker)?;
-    let rest = &comment[at + marker.len()..];
+    let text = comment
+        .strip_prefix("//")
+        .or_else(|| comment.strip_prefix("/*"))
+        .unwrap_or(comment);
+    let rest = text.trim_start().strip_prefix(marker)?;
     // `weavejig-ignore` must not match `weavejig-ignore-file`, nor a longer
     // word.
     if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-') {
