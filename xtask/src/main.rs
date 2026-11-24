@@ -2,6 +2,7 @@
 
 mod fetch;
 mod java;
+mod lint_score;
 mod manifest;
 mod score;
 mod scramble;
@@ -42,6 +43,19 @@ enum Task {
         /// How many disagreements to list for each part
         #[arg(long, default_value_t = 10, value_name = "N")]
         show: usize,
+
+        /// Score only these parts (comma-separated); all of them by default
+        #[arg(long, value_enum, value_delimiter = ',', value_name = "PARTS")]
+        part: Vec<Part>,
+
+        /// List the linter's disagreements for this rule only
+        #[arg(long, value_name = "RULE")]
+        rule: Option<String>,
+
+        /// Run the reference linters again instead of reusing their earlier
+        /// output for the same checks and files
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Print a file with its whitespace scrambled as the formatter score does,
     /// to reproduce a disagreement on scrambled input
@@ -57,6 +71,13 @@ enum Task {
         #[arg(long, default_value = "dev")]
         set: String,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Part {
+    Parser,
+    Formatter,
+    Linter,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -98,7 +119,19 @@ fn run(cli: Cli) -> Result<()> {
             corpus,
             json,
             show,
-        } => score(&manifest, &set, corpus, json, show),
+            part,
+            rule,
+            no_cache,
+        } => {
+            let options = ScoreOptions {
+                json,
+                show,
+                parts: part,
+                rule,
+                use_cache: !no_cache,
+            };
+            score(&manifest, &set, corpus, &options)
+        }
         Task::Scramble { file } => {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("cannot read {}", file.display()))?;
@@ -108,13 +141,30 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
+struct ScoreOptions {
+    json: bool,
+    show: usize,
+    /// Empty for every part.
+    parts: Vec<Part>,
+    rule: Option<String>,
+    use_cache: bool,
+}
+
 fn score(
     manifest: &Manifest,
     set: &str,
     corpus: Vec<PathBuf>,
-    json: bool,
-    show: usize,
+    options: &ScoreOptions,
 ) -> Result<()> {
+    let (json, show) = (options.json, options.show);
+    let wanted = |part: Part| options.parts.is_empty() || options.parts.contains(&part);
+    if let Some(rule) = &options.rule
+        && !weavejig_linter::all_rules()
+            .iter()
+            .any(|known| known.meta().id == rule)
+    {
+        bail!("unknown lint rule `{rule}`");
+    }
     let (label, dirs) = if !corpus.is_empty() {
         ("custom".to_string(), corpus)
     } else if set == "smoke" {
@@ -161,13 +211,36 @@ fn score(
         .unwrap_or(17);
     let jdk = java::locate(min_jdk);
 
-    let scores = [
-        score::parser(&sources, &jdk)?,
-        score::formatter(&sources, manifest, score::FormatInput::AsIs)?,
-        score::formatter(&sources, manifest, score::FormatInput::Scrambled)?,
-        score::linter(&sources, manifest)?,
-        score::pmd(),
-    ];
+    let mut scores = Vec::new();
+    if wanted(Part::Parser) {
+        scores.push(score::parser(&sources, &jdk)?);
+    }
+    if wanted(Part::Formatter) {
+        scores.push(score::formatter(
+            &sources,
+            manifest,
+            score::FormatInput::AsIs,
+        )?);
+        scores.push(score::formatter(
+            &sources,
+            manifest,
+            score::FormatInput::Scrambled,
+        )?);
+    }
+    if wanted(Part::Linter) {
+        let settings = lint_score::Settings {
+            use_cache: options.use_cache,
+            only_rule: options.rule.as_deref(),
+        };
+        scores.push(lint_score::checkstyle(&sources, manifest, &settings)?);
+        scores.push(lint_score::pmd(&sources, manifest, &settings)?);
+        // Coverage has no single rule's disagreements to list.
+        if options.rule.is_none() {
+            for config in ["sun_checks", "google_checks"] {
+                scores.push(lint_score::coverage(&sources, manifest, &settings, config)?);
+            }
+        }
+    }
 
     if json {
         let report = serde_json::json!({
@@ -182,10 +255,14 @@ fn score(
 
     print!("{}", score::render(&label, sources.len(), skipped, &scores));
     for score in &scores {
+        print!("{}", lint_score::render_rules(score));
+    }
+    for score in &scores {
         if score.mismatches.is_empty() || show == 0 {
             continue;
         }
-        if blind {
+        // Which checks have no rule says nothing about the corpus's files.
+        if blind && score.part != "Coverage" {
             println!(
                 "\n{}: {} disagreements (not listed for held-out sets)",
                 score.part,
@@ -193,7 +270,11 @@ fn score(
             );
             continue;
         }
-        println!("\n{} disagreements with {}:", score.part, score.reference);
+        if score.part == "Coverage" {
+            println!("\nChecks of {} without a rule:", score.reference);
+        } else {
+            println!("\n{} disagreements with {}:", score.part, score.reference);
+        }
         if score.reference.ends_with(", scrambled") {
             println!("  (reproduce the input with `cargo xtask scramble <file>`)");
         }

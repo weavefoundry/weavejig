@@ -69,10 +69,21 @@ impl Manifest {
 }
 
 impl Reference {
-    /// Where `cargo xtask fetch references` puts the jar.
+    /// Where `cargo xtask fetch references` puts the download: a jar, or a
+    /// zip of jars.
     pub fn jar_path(&self) -> PathBuf {
         let file = self.url.rsplit('/').next().unwrap_or("reference.jar");
         cache_dir().join("reference").join(file)
+    }
+
+    /// Whether the download is an archive to unpack rather than a jar to run.
+    pub fn is_archive(&self) -> bool {
+        self.url.ends_with(".zip")
+    }
+
+    /// Where an archive is unpacked: a directory named after the download.
+    pub fn unpacked_dir(&self) -> PathBuf {
+        self.jar_path().with_extension("")
     }
 }
 
@@ -89,7 +100,7 @@ mod tests {
     #[test]
     fn checked_in_manifest_is_valid() {
         let manifest = Manifest::load().unwrap();
-        for name in ["google-java-format", "checkstyle"] {
+        for name in ["google-java-format", "checkstyle", "pmd"] {
             let reference = manifest.reference(name).unwrap();
             assert_eq!(reference.sha256.len(), 64, "{name}");
             assert!(reference.url.contains(&reference.version), "{name}");

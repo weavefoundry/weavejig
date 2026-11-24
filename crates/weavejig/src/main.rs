@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 use weavejig_formatter::{FormatError, FormatOptions, format};
-use weavejig_linter::{RuleSet, all_rules, fix_all, lint};
+use weavejig_linter::{OptionDefault, RuleSet, Source, all_rules, fix_all, lint};
 
 use crate::config::StyleName;
 use crate::output::{Report, Summary, count};
@@ -73,9 +73,14 @@ struct CheckArgs {
     #[arg(long, value_enum, default_value = "text", value_name = "FORMAT")]
     output_format: OutputFormat,
 
-    /// Run only these rules (comma-separated), overriding the configuration
+    /// Run only these rules (comma-separated; `all` for every rule),
+    /// overriding the configuration
     #[arg(long, value_delimiter = ',', value_name = "RULES")]
     select: Vec<String>,
+
+    /// Run these rules as well as the selected ones (comma-separated)
+    #[arg(long, value_delimiter = ',', value_name = "RULES")]
+    extend_select: Vec<String>,
 
     /// Skip these rules (comma-separated), overriding the configuration
     #[arg(long, value_delimiter = ',', value_name = "RULES")]
@@ -162,9 +167,17 @@ struct Checked {
     fixed: usize,
 }
 
-fn check_source(file: &str, text: &str, rules: &RuleSet, fix: bool) -> (Checked, Option<String>) {
+/// Lints one source. `path` is `None` for standard input.
+fn check_source(
+    file: &str,
+    path: Option<&Path>,
+    text: &str,
+    rules: &RuleSet,
+    fix: bool,
+) -> (Checked, Option<String>) {
+    let source = Source::new(text, path);
     if fix {
-        let outcome = fix_all(text, rules);
+        let outcome = fix_all(source, rules);
         let diagnostics = output::convert(file, &outcome.text, &outcome.remaining);
         let changed = (outcome.text != text).then_some(outcome.text);
         (
@@ -175,7 +188,7 @@ fn check_source(file: &str, text: &str, rules: &RuleSet, fix: bool) -> (Checked,
             changed,
         )
     } else {
-        let diagnostics = output::convert(file, text, &lint(text, rules));
+        let diagnostics = output::convert(file, text, &lint(source, rules));
         (
             Checked {
                 diagnostics,
@@ -187,14 +200,19 @@ fn check_source(file: &str, text: &str, rules: &RuleSet, fix: bool) -> (Checked,
 }
 
 fn check(args: CheckArgs, loaded: &config::Loaded) -> Result<u8> {
-    let rules = loaded.config.rules(&args.select, &args.ignore)?;
+    let rules = loaded.config.rules(&config::SelectionOverrides {
+        select: &args.select,
+        extend_select: &args.extend_select,
+        ignore: &args.ignore,
+    })?;
+    let per_file_ignores = loaded.config.per_file_ignores(&loaded.root)?;
 
     // Files that could not be read or written. Each is reported and the
     // rest are still checked, so one bad file does not hide the others.
     let mut failed = 0;
     let results: Vec<Checked> = if is_stdin(&args.paths) {
         let text = read_stdin()?;
-        let (checked, fixed_text) = check_source("<stdin>", &text, &rules, args.fix);
+        let (checked, fixed_text) = check_source("<stdin>", None, &text, &rules, args.fix);
         if args.fix {
             // With `--fix`, standard output carries the fixed source, so the
             // report goes to standard error.
@@ -215,7 +233,15 @@ fn check(args: CheckArgs, loaded: &config::Loaded) -> Result<u8> {
             .map(|path| {
                 let text = read_source(path)?;
                 let file = path.display().to_string();
-                let (checked, fixed_text) = check_source(&file, &text, &rules, args.fix);
+                let ignored = per_file_ignores.for_path(path);
+                let narrowed;
+                let rules = if ignored.is_empty() {
+                    &rules
+                } else {
+                    narrowed = rules.without(&ignored);
+                    &narrowed
+                };
+                let (checked, fixed_text) = check_source(&file, Some(path), &text, rules, args.fix);
                 if let Some(fixed_text) = fixed_text {
                     fs::write(path, fixed_text)
                         .with_context(|| format!("cannot write {}", path.display()))?;
@@ -400,12 +426,34 @@ fn rules(args: RulesArgs) -> Result<u8> {
                 .iter()
                 .map(|rule| {
                     let meta = rule.meta();
+                    let options: Vec<_> = meta
+                        .options
+                        .iter()
+                        .map(|option| {
+                            let default = match option.default {
+                                OptionDefault::Bool(value) => serde_json::json!(value),
+                                OptionDefault::Int(value) => serde_json::json!(value),
+                                OptionDefault::Str(value) | OptionDefault::Regex(value) => {
+                                    serde_json::json!(value)
+                                }
+                                OptionDefault::List(values) => serde_json::json!(values),
+                            };
+                            serde_json::json!({
+                                "name": option.name,
+                                "type": option.default.type_name(),
+                                "default": default,
+                                "help": option.help,
+                            })
+                        })
+                        .collect();
                     serde_json::json!({
                         "id": meta.id,
                         "summary": meta.summary,
                         "fixable": meta.fixable,
+                        "default": meta.default,
                         "checkstyle": meta.checkstyle,
-                        "pmd": meta.pmd,
+                        "pmd": meta.pmd.map(|rule| rule.name),
+                        "options": options,
                     })
                 })
                 .collect();
@@ -420,7 +468,12 @@ fn rules(args: RulesArgs) -> Result<u8> {
             for rule in all_rules() {
                 let meta = rule.meta();
                 let fixable = if meta.fixable { "fix" } else { "   " };
-                println!("{:width$}  {fixable}  {}", meta.id, meta.summary);
+                // Rules that run only when selected are marked.
+                let selected = if meta.default { "      " } else { "opt-in" };
+                println!(
+                    "{:width$}  {fixable}  {selected}  {}",
+                    meta.id, meta.summary
+                );
             }
         }
     }

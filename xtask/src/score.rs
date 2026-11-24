@@ -1,7 +1,7 @@
 //! `cargo xtask score`: measures each part of WeaveJig against its reference
 //! tool over a corpus of Java files.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -10,15 +10,15 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde::Serialize;
 use weavejig_formatter::{FormatOptions, format};
-use weavejig_linter::{RuleSet, all_rules, lint_tree};
-use weavejig_syntax::{LineIndex, parse};
+use weavejig_syntax::parse;
 
 use crate::java::{self, Jdk};
+use crate::lint_score::RuleScore;
 use crate::manifest::{Manifest, cache_dir, repo_root};
 use crate::scramble::scramble;
 
 /// Files per reference-tool invocation, to stay under command-line limits.
-const CHUNK: usize = 400;
+pub(crate) const CHUNK: usize = 400;
 
 pub struct Source {
     pub path: PathBuf,
@@ -69,13 +69,16 @@ pub struct Score {
     pub total: Option<usize>,
     pub percent: Option<f64>,
     pub detail: String,
+    /// For the linter: how each rule compares with the check it mirrors.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RuleScore>,
     /// Individual disagreements, for development.
     #[serde(skip)]
     pub mismatches: Vec<String>,
 }
 
 impl Score {
-    fn measured(
+    pub(crate) fn measured(
         part: &'static str,
         reference: String,
         matched: usize,
@@ -91,11 +94,16 @@ impl Score {
             total: Some(total),
             percent,
             detail,
+            rules: Vec::new(),
             mismatches,
         }
     }
 
-    fn unavailable(part: &'static str, reference: String, why: impl Into<String>) -> Score {
+    pub(crate) fn unavailable(
+        part: &'static str,
+        reference: String,
+        why: impl Into<String>,
+    ) -> Score {
         Score {
             part,
             reference,
@@ -103,13 +111,14 @@ impl Score {
             total: None,
             percent: None,
             detail: why.into(),
+            rules: Vec::new(),
             mismatches: Vec::new(),
         }
     }
 }
 
 /// Paths are shown relative to the repository when they are inside it.
-fn display(path: &Path) -> String {
+pub(crate) fn display(path: &Path) -> String {
     let root = fs::canonicalize(repo_root()).unwrap_or_else(|_| repo_root());
     path.strip_prefix(&root)
         .unwrap_or(path)
@@ -118,7 +127,7 @@ fn display(path: &Path) -> String {
 }
 
 /// A scratch directory under `.weavejig/tmp`, emptied first.
-fn scratch_dir(name: &str) -> Result<PathBuf> {
+pub(crate) fn scratch_dir(name: &str) -> Result<PathBuf> {
     let dir = cache_dir()
         .join("tmp")
         .join(format!("{name}-{}", std::process::id()));
@@ -375,242 +384,6 @@ pub fn formatter(sources: &[Source], manifest: &Manifest, input: FormatInput) ->
     ))
 }
 
-// --- Linter -----------------------------------------------------------------
-
-fn xml_unescape(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-}
-
-fn xml_attribute(tag: &str, name: &str) -> Option<String> {
-    let start = tag.find(&format!(" {name}=\""))? + name.len() + 3;
-    let end = start + tag[start..].find('"')?;
-    Some(xml_unescape(&tag[start..end]))
-}
-
-#[derive(Debug, Default, PartialEq)]
-struct CheckstyleReport {
-    /// (file, check name without the `Check` suffix, line).
-    violations: Vec<(String, String, u32)>,
-    /// Files Checkstyle could not process.
-    failed: HashSet<String>,
-}
-
-/// Reads Checkstyle's XML report (`-f xml`).
-fn parse_checkstyle_xml(xml: &str, report: &mut CheckstyleReport) {
-    let mut file = String::new();
-    for tag in xml.split('<').skip(1) {
-        if tag.starts_with("file ") {
-            file = xml_attribute(tag, "name").unwrap_or_default();
-        } else if tag.starts_with("exception") {
-            report.failed.insert(file.clone());
-        } else if tag.starts_with("error ") {
-            let source = xml_attribute(tag, "source").unwrap_or_default();
-            let check = source
-                .rsplit('.')
-                .next()
-                .and_then(|name| name.strip_suffix("Check"));
-            let line = xml_attribute(tag, "line").and_then(|line| line.parse().ok());
-            match (check, line) {
-                (Some(check), Some(line)) => {
-                    report
-                        .violations
-                        .push((file.clone(), check.to_string(), line));
-                }
-                // An error that is not from a check means the file failed.
-                _ => {
-                    report.failed.insert(file.clone());
-                }
-            }
-        }
-    }
-}
-
-/// A Checkstyle configuration enabling exactly the checks WeaveJig mirrors,
-/// with their default options.
-fn checkstyle_config(checks: &[&str]) -> String {
-    let mut xml = String::from(
-        "<?xml version=\"1.0\"?>\n<!DOCTYPE module PUBLIC\n  \
-         \"-//Checkstyle//DTD Checkstyle Configuration 1.3//EN\"\n  \
-         \"https://checkstyle.org/dtds/configuration_1_3.dtd\">\n\
-         <module name=\"Checker\">\n  <module name=\"TreeWalker\">\n",
-    );
-    for check in checks {
-        xml.push_str(&format!("    <module name=\"{check}\"/>\n"));
-    }
-    xml.push_str("  </module>\n</module>\n");
-    xml
-}
-
-/// How two sets of diagnostics compare.
-#[derive(Debug, PartialEq)]
-struct Agreement {
-    matched: usize,
-    /// Reported by the reference only.
-    missing: usize,
-    /// Reported by WeaveJig only.
-    extra: usize,
-}
-
-type DiagnosticKey = (usize, &'static str, u32);
-
-fn compare(reference: &BTreeSet<DiagnosticKey>, ours: &BTreeSet<DiagnosticKey>) -> Agreement {
-    let matched = reference.intersection(ours).count();
-    Agreement {
-        matched,
-        missing: reference.len() - matched,
-        extra: ours.len() - matched,
-    }
-}
-
-/// Share of diagnostics on which WeaveJig and Checkstyle agree by rule and
-/// line: matched / (matched + reported by only one of them).
-pub fn linter(sources: &[Source], manifest: &Manifest) -> Result<Score> {
-    const PART: &str = "Linter";
-    let reference = manifest.reference("checkstyle")?;
-    let name = format!("Checkstyle {}", reference.version);
-    let jar = reference.jar_path();
-    if !jar.is_file() {
-        return Ok(Score::unavailable(
-            PART,
-            name,
-            "not downloaded; run `cargo xtask fetch references`",
-        ));
-    }
-    let jdk = match java::locate(reference.min_jdk) {
-        Ok(jdk) => jdk,
-        Err(why) => return Ok(Score::unavailable(PART, name, why)),
-    };
-
-    // Checkstyle check name -> WeaveJig rule id.
-    let rule_for: HashMap<&str, &'static str> = all_rules()
-        .iter()
-        .filter_map(|rule| Some((rule.meta().checkstyle?, rule.meta().id)))
-        .collect();
-    let mut checks: Vec<&str> = rule_for.keys().copied().collect();
-    checks.sort_unstable();
-    let rules = RuleSet::from_selection(
-        Some(
-            &rule_for
-                .values()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>(),
-        ),
-        &[],
-    )?;
-
-    let dir = scratch_dir("checkstyle")?;
-    let config = dir.join("config.xml");
-    fs::write(&config, checkstyle_config(&checks))?;
-    let mut report = CheckstyleReport::default();
-    for (i, chunk) in sources.chunks(CHUNK).enumerate() {
-        let out = dir.join(format!("report-{i}.xml"));
-        // Checkstyle exits non-zero when it finds violations, so the exit
-        // status says nothing; the report file is what matters.
-        let output = Command::new(&jdk.java)
-            .arg("-jar")
-            .arg(&jar)
-            .arg("-c")
-            .arg(&config)
-            .args(["-f", "xml", "-o"])
-            .arg(&out)
-            .args(chunk.iter().map(|source| &source.path))
-            .output()
-            .context("cannot run Checkstyle")?;
-        let Ok(xml) = fs::read_to_string(&out) else {
-            fs::remove_dir_all(&dir).ok();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let why = format!(
-                "Checkstyle failed: {}",
-                stderr.lines().next().unwrap_or("?")
-            );
-            return Ok(Score::unavailable(PART, name, why));
-        };
-        parse_checkstyle_xml(&xml, &mut report);
-    }
-    fs::remove_dir_all(&dir).ok();
-
-    let index_of: HashMap<String, usize> = sources
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.path.display().to_string(), i))
-        .collect();
-    // Only files both tools could process are compared.
-    let ours_per_file: Vec<Option<Vec<(&'static str, u32)>>> = sources
-        .par_iter()
-        .map(|source| {
-            let parse = parse(&source.text);
-            if !parse.is_ok() || report.failed.contains(&source.path.display().to_string()) {
-                return None;
-            }
-            let lines = LineIndex::new(&source.text);
-            let diagnostics = lint_tree(&parse.syntax(), &rules);
-            Some(
-                diagnostics
-                    .iter()
-                    .map(|d| (d.rule, lines.line_col(&source.text, d.range.start()).line))
-                    .collect(),
-            )
-        })
-        .collect();
-
-    let mut ours = BTreeSet::new();
-    for (i, diagnostics) in ours_per_file.iter().enumerate() {
-        for (rule, line) in diagnostics.iter().flatten() {
-            ours.insert((i, *rule, *line));
-        }
-    }
-    let mut theirs = BTreeSet::new();
-    for (file, check, line) in &report.violations {
-        let (Some(&i), Some(&rule)) = (index_of.get(file), rule_for.get(check.as_str())) else {
-            continue;
-        };
-        if ours_per_file[i].is_some() {
-            theirs.insert((i, rule, *line));
-        }
-    }
-
-    let agreement = compare(&theirs, &ours);
-    let mut mismatches = Vec::new();
-    for (i, rule, line) in theirs.difference(&ours) {
-        mismatches.push(format!(
-            "{}:{line}: {rule}: only Checkstyle reports this",
-            display(&sources[*i].path)
-        ));
-    }
-    for (i, rule, line) in ours.difference(&theirs) {
-        mismatches.push(format!(
-            "{}:{line}: {rule}: only WeaveJig reports this",
-            display(&sources[*i].path)
-        ));
-    }
-    mismatches.sort();
-    let total = agreement.matched + agreement.missing + agreement.extra;
-    let detail = format!(
-        "{}/{total} diagnostics match over {} rules ({} missed, {} extra)",
-        agreement.matched,
-        checks.len(),
-        agreement.missing,
-        agreement.extra
-    );
-    Ok(Score::measured(
-        PART,
-        name,
-        agreement.matched,
-        total,
-        detail,
-        mismatches,
-    ))
-}
-
-/// PMD is a reference for the linter too, but nothing runs it yet.
-pub fn pmd() -> Score {
-    Score::unavailable("Linter", "PMD".into(), "not wired up yet")
-}
-
 // --- Report -----------------------------------------------------------------
 
 pub fn render(label: &str, files: usize, skipped: usize, scores: &[Score]) -> String {
@@ -675,65 +448,6 @@ mod tests {
     }
 
     #[test]
-    fn checkstyle_xml() {
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<checkstyle version="14.4.0">
-<file name="/src/A.java">
-<error line="6" column="33" severity="error" message="Should use uppercase &apos;L&apos;." source="com.puppycrawl.tools.checkstyle.checks.UpperEllCheck"/>
-<error line="11" column="5" severity="error" message="&apos;if&apos; construct must use &apos;{}&apos;s." source="com.puppycrawl.tools.checkstyle.checks.blocks.NeedBracesCheck"/>
-</file>
-<file name="/src/B&amp;C.java">
-<error line="1" severity="error" message="IllegalStateException occurred while parsing file /src/B&amp;C.java." source="com.puppycrawl.tools.checkstyle.Checker"/>
-</file>
-<file name="/src/D.java">
-</file>
-</checkstyle>
-"#;
-        let mut report = CheckstyleReport::default();
-        parse_checkstyle_xml(xml, &mut report);
-        assert_eq!(
-            report.violations,
-            [
-                ("/src/A.java".to_string(), "UpperEll".to_string(), 6),
-                ("/src/A.java".to_string(), "NeedBraces".to_string(), 11),
-            ]
-        );
-        assert_eq!(report.failed, HashSet::from(["/src/B&C.java".to_string()]));
-    }
-
-    #[test]
-    fn checkstyle_config_lists_checks() {
-        let xml = checkstyle_config(&["NeedBraces", "UpperEll"]);
-        assert!(xml.contains("<module name=\"TreeWalker\">"));
-        assert!(xml.contains("<module name=\"NeedBraces\"/>"));
-        assert!(xml.contains("<module name=\"UpperEll\"/>"));
-    }
-
-    #[test]
-    fn every_mirrored_rule_names_a_distinct_check() {
-        let checks: Vec<_> = all_rules()
-            .iter()
-            .filter_map(|r| r.meta().checkstyle)
-            .collect();
-        let distinct: HashSet<_> = checks.iter().collect();
-        assert_eq!(checks.len(), distinct.len());
-    }
-
-    #[test]
-    fn agreement() {
-        let reference = BTreeSet::from([(0, "a", 1), (0, "a", 2), (1, "b", 5)]);
-        let ours = BTreeSet::from([(0, "a", 2), (1, "b", 5), (1, "b", 9), (2, "a", 1)]);
-        assert_eq!(
-            compare(&reference, &ours),
-            Agreement {
-                matched: 2,
-                missing: 1,
-                extra: 2
-            }
-        );
-    }
-
-    #[test]
     fn report_table() {
         let scores = [
             Score::measured(
@@ -745,7 +459,7 @@ mod tests {
                 vec![],
             ),
             Score::unavailable("Linter", "Checkstyle 14.4.0".into(), "not downloaded"),
-            pmd(),
+            Score::unavailable("Linter", "PMD 7.29.0".into(), "not downloaded"),
         ];
         let table = render("smoke", 10, 0, &scores);
         assert!(
@@ -757,6 +471,6 @@ mod tests {
             "{table}"
         );
         // A repeated part name is printed once.
-        assert!(table.contains("\n           PMD "), "{table}");
+        assert!(table.contains("\n           PMD 7.29.0 "), "{table}");
     }
 }

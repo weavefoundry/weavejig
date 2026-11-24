@@ -34,10 +34,35 @@ pub fn references(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+/// Unpacks a downloaded archive, unless that has been done already. The
+/// marker file records which download the directory holds.
+fn unpack(name: &str, reference: &Reference) -> Result<()> {
+    let dir = reference.unpacked_dir();
+    let marker = dir.join(".weavejig-sha256");
+    if fs::read_to_string(&marker).is_ok_and(|sha| sha.trim() == reference.sha256) {
+        return Ok(());
+    }
+    println!("{name} {}: unpacking", reference.version);
+    if dir.exists() {
+        fs::remove_dir_all(&dir)?;
+    }
+    fs::create_dir_all(&dir)?;
+    run(Command::new("unzip")
+        .arg("-q")
+        .arg(reference.jar_path())
+        .arg("-d")
+        .arg(&dir))?;
+    fs::write(marker, &reference.sha256)?;
+    Ok(())
+}
+
 fn fetch_reference(name: &str, reference: &Reference) -> Result<()> {
     let jar = reference.jar_path();
     if jar.is_file() && sha256(&jar)? == reference.sha256 {
         println!("{name} {}: already downloaded", reference.version);
+        if reference.is_archive() {
+            unpack(name, reference)?;
+        }
         return Ok(());
     }
     println!(
@@ -63,6 +88,9 @@ fn fetch_reference(name: &str, reference: &Reference) -> Result<()> {
         );
     }
     fs::rename(&partial, &jar)?;
+    if reference.is_archive() {
+        unpack(name, reference)?;
+    }
     Ok(())
 }
 

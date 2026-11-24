@@ -62,7 +62,7 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-      - name: Download google-java-format and Checkstyle
+      - name: Download google-java-format, Checkstyle and PMD
         run: cargo xtask fetch references
       # The smoke corpus is small; this checks that the harness works end to
       # end and shows the scores on every change. The scores themselves do

@@ -18,6 +18,7 @@ weavejig-syntax.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true
+globset.workspace = true
 ignore.workspace = true
 rayon.workspace = true
 serde.workspace = true

@@ -1,24 +1,24 @@
 use weavejig_syntax::{SyntaxKind, SyntaxKind::*, SyntaxNode, SyntaxToken, child_token};
 
-use crate::{Diagnostic, Edit, Fix, Rule, RuleMeta};
+use crate::{Context, Diagnostic, Edit, Fix, Rule, RuleMeta};
 
 /// The bodies of `if`, `else`, `for`, `while` and `do` must be blocks.
 pub(crate) struct NeedBraces;
 
-static META: RuleMeta = RuleMeta {
-    id: "need-braces",
-    summary: "`if`, `else`, `for`, `while` and `do` bodies should use braces",
-    checkstyle: Some("NeedBraces"),
-    pmd: None,
-    fixable: true,
-};
+static META: RuleMeta = RuleMeta::new(
+    "need-braces",
+    "`if`, `else`, `for`, `while` and `do` bodies should use braces",
+)
+.checkstyle("NeedBraces")
+.pmd("codestyle", "ControlStatementBraces")
+.fixable();
 
 impl Rule for NeedBraces {
     fn meta(&self) -> &'static RuleMeta {
         &META
     }
 
-    fn check_node(&self, node: &SyntaxNode, out: &mut Vec<Diagnostic>) {
+    fn check_node(&self, node: &SyntaxNode, _ctx: &Context<'_>, out: &mut Vec<Diagnostic>) {
         let children: Vec<SyntaxNode> = node.children().collect();
         match node.kind() {
             IF_STMT => {
@@ -52,7 +52,9 @@ fn check_body(
     out.push(Diagnostic {
         rule: META.id,
         message: format!("`{}` body should use braces", keyword.text()),
-        range: keyword.text_range(),
+        // From the keyword, where Checkstyle reports it, to the end of the
+        // statement that needs the braces, where PMD does.
+        range: keyword.text_range().cover(body.text_range()),
         fix: Some(fix(&keyword, body)),
     });
 }

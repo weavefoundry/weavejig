@@ -1,20 +1,21 @@
 use weavejig_syntax::{
-    SyntaxKind::*, SyntaxNode, TextRange, modifier_rank as rank, significant_children,
+    SyntaxKind::*, SyntaxNode, TextRange, child_token, modifier_rank as rank, significant_children,
 };
 
-use crate::{Diagnostic, Edit, Fix, Rule, RuleMeta};
+use crate::ast;
+
+use crate::{Context, Diagnostic, Edit, Fix, Rule, RuleMeta};
 
 /// Modifiers should appear in the order the Java Language Specification
 /// suggests, with annotations before all keywords.
 pub(crate) struct ModifierOrder;
 
-static META: RuleMeta = RuleMeta {
-    id: "modifier-order",
-    summary: "modifiers should follow the order suggested by the JLS",
-    checkstyle: Some("ModifierOrder"),
-    pmd: None,
-    fixable: true,
-};
+static META: RuleMeta = RuleMeta::new(
+    "modifier-order",
+    "modifiers should follow the order suggested by the JLS",
+)
+.checkstyle("ModifierOrder")
+.fixable();
 
 struct Modifier {
     /// The keyword, or `None` for an annotation.
@@ -56,7 +57,7 @@ impl Rule for ModifierOrder {
         &META
     }
 
-    fn check_node(&self, node: &SyntaxNode, out: &mut Vec<Diagnostic>) {
+    fn check_node(&self, node: &SyntaxNode, _ctx: &Context<'_>, out: &mut Vec<Diagnostic>) {
         if node.kind() != MODIFIERS {
             return;
         }
@@ -65,32 +66,49 @@ impl Rule for ModifierOrder {
         let leading = all.iter().take_while(|m| m.keyword.is_none()).count();
         let rest = &all[leading..];
 
-        // An annotation between keywords is out of place. Those after the
-        // last keyword are type annotations (`public @Nullable String f()`,
-        // `private final @NonNull @Valid Foo x`).
-        let last_keyword = rest.iter().rposition(|m| m.keyword.is_some());
-        if let Some(annotation) = rest
+        // An annotation after a keyword is out of place, unless it may be a
+        // type annotation: on a variable, parameter or constructor, or on a
+        // method that returns something (`public @Nullable String f()`).
+        let may_annotate_type = match node.parent() {
+            Some(owner) => match owner.kind() {
+                METHOD_DECL => {
+                    ast::declared_type(&owner).is_some_and(|ty| child_token(&ty, VOID_KW).is_none())
+                }
+                kind => !kind.is_type_decl(),
+            },
+            None => true,
+        };
+        let misplaced = (!may_annotate_type)
+            .then(|| rest.iter().position(|m| m.keyword.is_none()))
+            .flatten();
+
+        let text = |m: &Modifier| m.keyword.clone().unwrap_or_default();
+        let keywords: Vec<(usize, &Modifier)> = rest
             .iter()
             .enumerate()
-            .find(|(i, m)| m.keyword.is_none() && last_keyword.is_some_and(|last| *i < last))
+            .filter(|(_, m)| m.keyword.is_some())
+            .collect();
+        let offender = keywords
+            .windows(2)
+            .find(|pair| rank(&text(pair[0].1)) > rank(&text(pair[1].1)))
+            .map(|pair| pair[1]);
+
+        // Whichever comes first is reported.
+        if let Some(annotation) = misplaced
+            && offender.is_none_or(|(at, _)| annotation < at)
         {
             out.push(Diagnostic {
                 rule: META.id,
                 message: "annotation should come before all modifier keywords".to_string(),
-                range: annotation.1.range,
+                range: rest[annotation].range,
                 fix: None,
             });
             return;
         }
-
-        let keywords: Vec<&Modifier> = rest.iter().filter(|m| m.keyword.is_some()).collect();
-        let text = |m: &Modifier| m.keyword.clone().unwrap_or_default();
-        let Some(offender) = keywords
-            .windows(2)
-            .find(|pair| rank(&text(pair[0])) > rank(&text(pair[1])))
-        else {
+        let Some((_, offender)) = offender else {
             return;
         };
+        let keywords: Vec<&Modifier> = keywords.into_iter().map(|(_, m)| m).collect();
 
         let mut sorted: Vec<String> = keywords.iter().map(|m| text(m)).collect();
         sorted.sort_by_key(|keyword| rank(keyword));
@@ -104,10 +122,10 @@ impl Rule for ModifierOrder {
             rule: META.id,
             message: format!(
                 "`{}` is out of order; the JLS suggests `{}`",
-                text(offender[1]),
+                text(offender),
                 sorted.join(" ")
             ),
-            range: offender[1].range,
+            range: offender.range,
             fix: Some(Fix {
                 description: "reorder the modifiers".to_string(),
                 edits,

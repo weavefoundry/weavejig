@@ -2,7 +2,7 @@
 
 use weavejig_syntax::TextSize;
 
-use crate::{Diagnostic, RuleSet, lint};
+use crate::{Diagnostic, RuleSet, Source, lint};
 
 /// Fixes can enable or conflict with other fixes, so they are applied in
 /// passes. Real code settles in two or three; the cap guards against a pair
@@ -63,11 +63,13 @@ pub struct FixOutcome {
 }
 
 /// Lints `text` and applies fixes until none are left to apply.
-pub fn fix_all(text: &str, rules: &RuleSet) -> FixOutcome {
-    let mut text = text.to_string();
+pub fn fix_all<'a>(source: impl Into<Source<'a>>, rules: &RuleSet) -> FixOutcome {
+    let source = source.into();
+    let path = source.path;
+    let mut text = source.text.to_string();
     let mut fixed = 0;
     for _ in 0..MAX_PASSES {
-        let diagnostics = lint(&text, rules);
+        let diagnostics = lint(Source::new(&text, path), rules);
         let (next, applied) = apply_fixes(&text, &diagnostics);
         if applied == 0 {
             return FixOutcome {
@@ -89,7 +91,7 @@ pub fn fix_all(text: &str, rules: &RuleSet) -> FixOutcome {
         text = next;
         fixed += applied;
     }
-    let remaining = lint(&text, rules);
+    let remaining = lint(Source::new(&text, path), rules);
     FixOutcome {
         text,
         fixed,
