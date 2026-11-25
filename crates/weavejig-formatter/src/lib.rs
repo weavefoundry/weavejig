@@ -6,16 +6,19 @@
 //! within the line width ([`printer`]).
 //!
 //! Before that, the source text itself is fixed up as google-java-format
-//! does: modifier keywords are put in order ([`modifiers`]), and unused
-//! imports are removed and the rest sorted ([`imports`]).
+//! does: modifier keywords are put in order ([`modifiers`]), unused imports
+//! are removed and the rest sorted ([`imports`]), and tokens that do
+//! nothing, such as the `;` of an empty statement, are dropped
+//! ([`redundant`]).
 //!
 //! Finally, string literals that run past the line width are split into
 //! concatenations of shorter ones ([`strings`]).
 //!
 //! The result is then checked against the input: formatting may only change
 //! whitespace, the order of imports and of modifier keywords, which imports
-//! there are (only unused ones may go), and how string literals joined by
-//! `+` are split. If any other token or comment would be added, dropped or
+//! there are (only unused ones may go), how string literals joined by `+`
+//! are split, the indentation of text blocks ([`textblock`]), which is not
+//! part of their value, and whether the tokens that do nothing are there. If any other token or comment would be added, dropped or
 //! changed, [`format`] returns an error instead of the text, so a formatter
 //! bug cannot silently damage code.
 
@@ -26,11 +29,13 @@ mod imports;
 mod javadoc;
 mod modifiers;
 mod printer;
+mod redundant;
 mod spacing;
 mod strings;
+mod textblock;
 mod verify;
 
-use weavejig_syntax::{SyntaxError, SyntaxNode, TextRange, parse};
+use weavejig_syntax::{SyntaxError, SyntaxNode, TextRange, TextSize, parse};
 
 /// The two styles google-java-format offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -126,11 +131,15 @@ pub(crate) struct Edit {
     pub(crate) text: String,
 }
 
-/// The source with modifiers reordered and unused imports removed, or
-/// `None` if neither changes anything.
+/// The source with modifiers reordered, unused imports removed and tokens
+/// that do nothing dropped, or `None` if none of that changes anything.
 fn fix(text: &str, root: &SyntaxNode) -> Option<String> {
     let mut edits = modifiers::reorder(root);
     edits.extend(imports::fix(text, root));
+    edits.extend(redundant::tokens(root).into_iter().map(|range| Edit {
+        range: whole_line(text, range),
+        text: String::new(),
+    }));
     if edits.is_empty() {
         return None;
     }
@@ -145,6 +154,25 @@ fn fix(text: &str, root: &SyntaxNode) -> Option<String> {
     }
     out.push_str(&text[at..]);
     Some(out)
+}
+
+/// `range`, widened to its whole line with the line break if nothing else is
+/// on the line: removing a token must not leave an empty line behind.
+fn whole_line(text: &str, range: TextRange) -> TextRange {
+    let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+    let blank = |part: &str| part.chars().all(|c| c == ' ' || c == '\t');
+    let line_start = text[..start].rfind('\n').map_or(0, |newline| newline + 1);
+    let Some(line_end) = text[end..].find('\n').map(|newline| end + newline + 1) else {
+        return range;
+    };
+    let rest = text[end..line_end].trim_end_matches(['\n', '\r']);
+    if !blank(&text[line_start..start]) || !blank(rest) {
+        return range;
+    }
+    match (TextSize::try_from(line_start), TextSize::try_from(line_end)) {
+        (Ok(from), Ok(to)) => TextRange::new(from, to),
+        _ => range,
+    }
 }
 
 /// The line separator to write, which is the first one in `text`, as

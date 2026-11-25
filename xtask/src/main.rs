@@ -1,6 +1,7 @@
 //! Development tasks for WeaveJig. Run with `cargo xtask <command>`.
 
 mod fetch;
+mod format_diff;
 mod java;
 mod lint_score;
 mod manifest;
@@ -82,7 +83,7 @@ enum Part {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum FetchTarget {
-    /// The google-java-format and Checkstyle jars
+    /// google-java-format, Checkstyle and PMD
     References,
     /// The open-source codebases of a corpus set
     Corpus,
@@ -216,16 +217,9 @@ fn score(
         scores.push(score::parser(&sources, &jdk)?);
     }
     if wanted(Part::Formatter) {
-        scores.push(score::formatter(
-            &sources,
-            manifest,
-            score::FormatInput::AsIs,
-        )?);
-        scores.push(score::formatter(
-            &sources,
-            manifest,
-            score::FormatInput::Scrambled,
-        )?);
+        for input in [score::FormatInput::AsIs, score::FormatInput::Scrambled] {
+            scores.push(score::formatter(&sources, &dirs, manifest, input)?);
+        }
     }
     if wanted(Part::Linter) {
         let settings = lint_score::Settings {
@@ -254,6 +248,9 @@ fn score(
     }
 
     print!("{}", score::render(&label, sources.len(), skipped, &scores));
+    for score in &scores {
+        print!("{}", score::render_formatter(score));
+    }
     for score in &scores {
         print!("{}", lint_score::render_rules(score));
     }
