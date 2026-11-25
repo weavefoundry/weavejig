@@ -60,6 +60,9 @@ pub(crate) enum Doc {
     LineComment(String),
     /// A `/** ... */` comment, which is reflowed for the column it lands on.
     Javadoc(String),
+    /// A text block, whose lines are indented like the line that its
+    /// opening delimiter lands on.
+    TextBlock(String),
 }
 
 /// Names a [`Doc::TaggedGroup`].
@@ -83,6 +86,7 @@ impl Doc {
             | Doc::NextLineIfFits(_, _, forced) => *forced,
             Doc::LineComment(_) => false,
             Doc::Javadoc(text) => text.contains('\n'),
+            Doc::TextBlock(_) => true,
         }
     }
 }
@@ -92,9 +96,10 @@ impl Doc {
     /// mandatory line breaks in it.
     pub(crate) fn flat_width(&self) -> usize {
         match self {
-            Doc::Text(text) | Doc::Suffix(text) | Doc::LineComment(text) | Doc::Javadoc(text) => {
-                text.chars().count()
-            }
+            Doc::Text(text) | Doc::Javadoc(text) => text.chars().count(),
+            Doc::Suffix(text) | Doc::LineComment(text) => comment_width(text),
+            // Only the opening delimiter is on the line.
+            Doc::TextBlock(_) => 3,
             Doc::Space | Doc::Line => 1,
             Doc::SoftLine | Doc::HardLine | Doc::BlankLine | Doc::CommentBreak => 0,
             Doc::Concat(docs, _) => docs.iter().map(Doc::flat_width).sum(),
@@ -107,6 +112,13 @@ impl Doc {
             Doc::FillBreak(doc, _) => 1 + doc.flat_width(),
         }
     }
+}
+
+/// The columns a `//` comment takes when it is decided what fits on a
+/// line. An empty one counts as `// `, one more than it prints as:
+/// google-java-format measures it so.
+pub(crate) fn comment_width(comment: &str) -> usize {
+    comment.chars().count() + usize::from(comment == "//")
 }
 
 pub(crate) fn text(text: impl Into<String>) -> Doc {
@@ -216,7 +228,8 @@ fn hoist_comment_break(doc: &mut Doc) -> bool {
         | Doc::HardLine
         | Doc::BlankLine
         | Doc::LineComment(_)
-        | Doc::Javadoc(_) => false,
+        | Doc::Javadoc(_)
+        | Doc::TextBlock(_) => false,
     }
 }
 

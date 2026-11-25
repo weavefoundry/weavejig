@@ -12,6 +12,7 @@ use serde::Serialize;
 use weavejig_formatter::{FormatOptions, format};
 use weavejig_syntax::parse;
 
+use crate::format_diff::{self, Kind};
 use crate::java::{self, Jdk};
 use crate::lint_score::RuleScore;
 use crate::manifest::{Manifest, cache_dir, repo_root};
@@ -59,6 +60,21 @@ pub fn load_sources(dirs: &[PathBuf]) -> Result<(Vec<Source>, usize)> {
     Ok((sources, skipped))
 }
 
+/// How many files differ from the reference in one way.
+#[derive(Debug, Serialize)]
+pub struct KindCount {
+    pub kind: Kind,
+    pub files: usize,
+}
+
+/// The formatter's score on one codebase of a corpus.
+#[derive(Debug, Serialize)]
+pub struct CodebaseScore {
+    pub codebase: String,
+    pub identical: usize,
+    pub files: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Score {
     pub part: &'static str,
@@ -72,6 +88,13 @@ pub struct Score {
     /// For the linter: how each rule compares with the check it mirrors.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<RuleScore>,
+    /// For the formatter: the files that differ, counted by kind of
+    /// difference.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<KindCount>,
+    /// For the formatter: the score of each codebase of the corpus.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub codebases: Vec<CodebaseScore>,
     /// Individual disagreements, for development.
     #[serde(skip)]
     pub mismatches: Vec<String>,
@@ -95,6 +118,8 @@ impl Score {
             percent,
             detail,
             rules: Vec::new(),
+            kinds: Vec::new(),
+            codebases: Vec::new(),
             mismatches,
         }
     }
@@ -112,6 +137,8 @@ impl Score {
             percent: None,
             detail: why.into(),
             rules: Vec::new(),
+            kinds: Vec::new(),
+            codebases: Vec::new(),
             mismatches: Vec::new(),
         }
     }
@@ -263,7 +290,13 @@ pub enum FormatInput {
 }
 
 /// Share of files that WeaveJig formats byte-for-byte like google-java-format.
-pub fn formatter(sources: &[Source], manifest: &Manifest, input: FormatInput) -> Result<Score> {
+/// `roots` are the corpus directories, which the score is also broken down by.
+pub fn formatter(
+    sources: &[Source],
+    roots: &[PathBuf],
+    manifest: &Manifest,
+    input: FormatInput,
+) -> Result<Score> {
     const PART: &str = "Formatter";
     let reference = manifest.reference("google-java-format")?;
     let mut name = format!("google-java-format {}", reference.version);
@@ -333,7 +366,8 @@ pub fn formatter(sources: &[Source], manifest: &Manifest, input: FormatInput) ->
 
     enum Outcome {
         Identical,
-        Different,
+        /// The kind of difference, and the first line that differs.
+        Different(Kind, usize),
         Unformattable(String),
         Excluded,
     }
@@ -349,7 +383,10 @@ pub fn formatter(sources: &[Source], manifest: &Manifest, input: FormatInput) ->
             };
             match format(&source.text, &FormatOptions::default()) {
                 Ok(actual) if actual == expected => Outcome::Identical,
-                Ok(_) => Outcome::Different,
+                Ok(actual) => Outcome::Different(
+                    format_diff::classify(&expected, &actual),
+                    format_diff::first_difference(&expected, &actual),
+                ),
                 Err(error) => Outcome::Unformattable(error.to_string()),
             }
         })
@@ -358,20 +395,56 @@ pub fn formatter(sources: &[Source], manifest: &Manifest, input: FormatInput) ->
 
     let (mut identical, mut total, mut unformattable, mut excluded) = (0, 0, 0, 0);
     let mut mismatches = Vec::new();
+    let mut kinds: HashMap<Kind, usize> = HashMap::new();
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .map(|root| fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
+        .collect();
+    let mut codebases: Vec<CodebaseScore> = roots
+        .iter()
+        .map(|root| CodebaseScore {
+            codebase: root.file_name().map_or_else(
+                || root.display().to_string(),
+                |name| name.to_string_lossy().into(),
+            ),
+            identical: 0,
+            files: 0,
+        })
+        .collect();
     for (source, outcome) in sources.iter().zip(outcomes) {
+        let codebase = roots
+            .iter()
+            .position(|root| source.path.starts_with(root))
+            .map(|i| &mut codebases[i]);
         match outcome {
             Outcome::Excluded => {
                 excluded += 1;
                 continue;
             }
-            Outcome::Identical => identical += 1,
-            Outcome::Different => {
-                mismatches.push(format!("{}: output differs", display(&source.path)))
+            Outcome::Identical => {
+                identical += 1;
+                if let Some(codebase) = codebase {
+                    codebase.identical += 1;
+                    codebase.files += 1;
+                }
+                total += 1;
+                continue;
+            }
+            Outcome::Different(kind, line) => {
+                *kinds.entry(kind).or_default() += 1;
+                mismatches.push(format!(
+                    "{}:{line}: output differs ({})",
+                    display(&source.path),
+                    kind.label()
+                ));
             }
             Outcome::Unformattable(error) => {
                 unformattable += 1;
                 mismatches.push(format!("{}: {error}", display(&source.path)));
             }
+        }
+        if let Some(codebase) = codebase {
+            codebase.files += 1;
         }
         total += 1;
     }
@@ -379,9 +452,73 @@ pub fn formatter(sources: &[Source], manifest: &Manifest, input: FormatInput) ->
         "{identical}/{total} files identical ({unformattable} WeaveJig could not format; \
          {excluded} excluded, rejected by the reference)"
     );
-    Ok(Score::measured(
-        PART, name, identical, total, detail, mismatches,
-    ))
+    let mut score = Score::measured(PART, name, identical, total, detail, mismatches);
+    score.kinds = Kind::ALL
+        .into_iter()
+        .filter_map(|kind| kinds.get(&kind).map(|&files| KindCount { kind, files }))
+        .collect();
+    score
+        .kinds
+        .sort_by_key(|count| std::cmp::Reverse(count.files));
+    // One codebase's score is the corpus's.
+    if codebases.len() > 1 {
+        score.codebases = codebases;
+    }
+    Ok(score)
+}
+
+/// The formatter's breakdowns: how many files differ in each way, and the
+/// score of each codebase. Both are totals, fit to print for a held-out set.
+pub fn render_formatter(score: &Score) -> String {
+    let mut out = String::new();
+    if !score.kinds.is_empty() {
+        let width = score
+            .kinds
+            .iter()
+            .map(|count| count.kind.label().len())
+            .max()
+            .unwrap_or(0)
+            .max(4);
+        out.push_str(&format!(
+            "\nFormatter differences from {}, by kind:\n  {:<width$}  {:>5}\n",
+            score.reference, "Kind", "Files"
+        ));
+        for count in &score.kinds {
+            out.push_str(&format!(
+                "  {:<width$}  {:>5}\n",
+                count.kind.label(),
+                count.files
+            ));
+        }
+    }
+    if !score.codebases.is_empty() {
+        let width = score
+            .codebases
+            .iter()
+            .map(|codebase| codebase.codebase.len())
+            .max()
+            .unwrap_or(0)
+            .max(8);
+        out.push_str(&format!(
+            "\nFormatter against {}, by codebase:\n  {:<width$}  {:>9}  {:>5}  {:>6}\n",
+            score.reference, "Codebase", "Identical", "Files", "Score"
+        ));
+        for codebase in &score.codebases {
+            let percent = if codebase.files > 0 {
+                format!(
+                    "{:.1}%",
+                    100.0 * codebase.identical as f64 / codebase.files as f64
+                )
+            } else {
+                "-".to_string()
+            };
+            out.push_str(&format!(
+                "  {:<width$}  {:>9}  {:>5}  {percent:>6}\n",
+                codebase.codebase, codebase.identical, codebase.files
+            ));
+        }
+    }
+    out
 }
 
 // --- Report -----------------------------------------------------------------

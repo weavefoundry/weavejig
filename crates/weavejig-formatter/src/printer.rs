@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use crate::doc::{Doc, Tag};
+use crate::textblock::TextBlock;
 
 /// Line breaks are not written when requested but held until the next text
 /// arrives. That makes `HardLine` and `BlankLine` idempotent and means lines
@@ -16,6 +17,8 @@ struct Output {
     pending: u8,
     /// Indentation of the line the next text starts, if `pending > 0`.
     pending_indent: usize,
+    /// Indentation of the line being written.
+    line_indent: usize,
 }
 
 impl Output {
@@ -46,6 +49,7 @@ impl Output {
                 self.text.push(' ');
             }
             self.column = indent;
+            self.line_indent = indent;
             self.pending = 0;
         }
         self.text.push_str(text);
@@ -66,6 +70,7 @@ pub(crate) fn print(doc: &Doc, line_width: usize) -> String {
         column: 0,
         pending: 0,
         pending_indent: 0,
+        line_indent: 0,
     };
     // (indentation, printed flat?, document), last entry printed first.
     let mut stack: Vec<(usize, bool, &Doc)> = vec![(0, false, doc)];
@@ -98,6 +103,22 @@ pub(crate) fn print(doc: &Doc, line_width: usize) -> String {
                 };
                 stack.push((indent + extra, flat, doc));
             }
+            Doc::TextBlock(token) => match TextBlock::parse(token) {
+                // A block at the margin stays there, delimiters and all.
+                Some(block) if block.at_margin => {
+                    out.newline(1, 0);
+                    out.write(&block.print(0));
+                }
+                Some(block) => {
+                    let indent = if out.pending > 0 {
+                        out.pending_indent
+                    } else {
+                        out.line_indent
+                    };
+                    out.write(&block.print(indent));
+                }
+                None => out.write(token),
+            },
             Doc::Javadoc(comment) => {
                 let column = if out.pending > 0 {
                     out.pending_indent
@@ -245,8 +266,12 @@ fn fits(doc: &Doc, rest: &[(usize, bool, &Doc)], mut remaining: isize) -> bool {
                 Some(newline) => return remaining >= width(&text[..newline]) as isize,
                 None => remaining -= width(text) as isize,
             },
+            // The line ends after the opening delimiter.
+            Doc::TextBlock(_) => return remaining >= 3,
             // A trailing comment counts: code wraps to make room for it.
-            Doc::Suffix(text) | Doc::LineComment(text) => remaining -= width(text) as isize,
+            Doc::Suffix(text) | Doc::LineComment(text) => {
+                remaining -= crate::doc::comment_width(text) as isize;
+            }
             Doc::Space => remaining -= 1,
             Doc::Line if flat => remaining -= 1,
             Doc::SoftLine if flat => {}

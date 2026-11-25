@@ -34,6 +34,9 @@ pub(crate) struct Formatter<'a> {
     /// Argument lists, by start offset, whose only argument is not laid out
     /// the special way a lone lambda usually is.
     plain_lists: RefCell<HashSet<TextSize>>,
+    /// The offset at which each line of the source starts.
+    line_starts: Vec<TextSize>,
+    source: String,
 }
 
 /// Annotations that google-java-format keeps next to the type they annotate
@@ -45,10 +48,13 @@ const TYPE_ANNOTATIONS: [&str; 4] = [
     "org.checkerframework.checker.nullness.qual.NonNull",
 ];
 
+/// Whether an annotation is given any values: `@A(1)`, but not `@A()`.
 fn has_arguments(annotation: &SyntaxElement) -> bool {
-    annotation
-        .as_node()
-        .is_some_and(|a| a.children().any(|c| c.kind() == ANNOTATION_ARGS))
+    annotation.as_node().is_some_and(|a| {
+        a.children()
+            .filter(|c| c.kind() == ANNOTATION_ARGS)
+            .any(|args| significant_children(&args).count() > 2)
+    })
 }
 
 fn first_of(element: &SyntaxElement) -> Option<SyntaxToken> {
@@ -130,7 +136,14 @@ impl<'a> Formatter<'a> {
             .filter(|(is_static, name)| !is_static && TYPE_ANNOTATIONS.contains(&name.as_str()))
             .filter_map(|(_, name)| name.rsplit('.').next().map(str::to_string))
             .collect();
+        let source = root.text().to_string();
+        let line_starts = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(newline, _)| newline + 1))
+            .filter_map(|start| TextSize::try_from(start).ok())
+            .collect();
         Formatter {
+            line_starts,
+            source,
             comments: Comments::collect(root),
             options,
             skip_leading: Cell::new(None),
@@ -144,6 +157,16 @@ impl<'a> Formatter<'a> {
         let tag = self.next_tag.get();
         self.next_tag.set(tag + 1);
         tag
+    }
+
+    /// The column of a token in the source, counted in characters from 0.
+    fn source_column(&self, token: &SyntaxToken) -> usize {
+        let offset = token.text_range().start();
+        let line = self.line_starts.partition_point(|start| *start <= offset);
+        let start = self.line_starts[line.saturating_sub(1)];
+        self.source[usize::from(start)..usize::from(offset)]
+            .chars()
+            .count()
     }
 
     fn block_indent(&self) -> u16 {
@@ -176,8 +199,12 @@ impl<'a> Formatter<'a> {
     }
 
     fn token(&self, token: &SyntaxToken) -> Doc {
+        let token_text = |token: &SyntaxToken| match token.kind() {
+            TEXT_BLOCK => Doc::TextBlock(token.text().to_string()),
+            _ => text(token.text()),
+        };
         let Some(trivia) = self.trivia(token) else {
-            return text(token.text());
+            return token_text(token);
         };
         let mut docs = Vec::new();
         if self.skip_leading.get() != Some(token.text_range().start()) {
@@ -192,9 +219,9 @@ impl<'a> Formatter<'a> {
             if same_line && !after_open {
                 docs.push(space());
             }
-            self.leading_comments(trivia, Some(token.kind()), &mut docs);
+            self.leading_comments_spaced(trivia, Some(token.kind()), true, &mut docs);
         }
-        docs.push(text(token.text()));
+        docs.push(token_text(token));
         for comment in &trivia.trailing {
             docs.push(space());
             docs.push(comment_doc(comment, true));
@@ -222,10 +249,22 @@ impl<'a> Formatter<'a> {
         before: Option<SyntaxKind>,
         docs: &mut Vec<Doc>,
     ) {
+        self.leading_comments_spaced(trivia, before, false, docs);
+    }
+
+    /// [`Formatter::leading_comments`], which leaves a blank line before the
+    /// first comment to the caller. With `keep_blank`, it is kept here: the
+    /// comment is inside an expression, where nothing else would.
+    fn leading_comments_spaced(
+        &self,
+        trivia: &TokenTrivia,
+        before: Option<SyntaxKind>,
+        keep_blank: bool,
+        docs: &mut Vec<Doc>,
+    ) {
         for (i, comment) in trivia.leading.iter().enumerate() {
             if comment.newlines_before > 0 {
-                // A blank line before the first comment is the caller's call.
-                let blank = i > 0 && comment.newlines_before >= 2;
+                let blank = (i > 0 || keep_blank) && comment.newlines_before >= 2;
                 docs.push(if blank { Doc::BlankLine } else { Doc::HardLine });
             }
             docs.push(comment_doc(comment, false));
@@ -336,9 +375,33 @@ impl<'a> Formatter<'a> {
     }
 
     pub(crate) fn node(&self, node: &SyntaxNode) -> Doc {
+        // Comments in front of an expression come before it, outside its
+        // layout: a comment on a line of its own must not make the
+        // expression wrap, nor take on the indentation of its later lines.
+        if is_expression(node.kind())
+            && let Some(first) = first_token(node)
+            && self.skip_leading.get() != Some(first.text_range().start())
+            && let Some(trivia) = self.trivia(&first)
+            && trivia
+                .leading
+                .iter()
+                .any(|comment| comment.newlines_before > 0)
+        {
+            let mut docs = Vec::new();
+            self.leading_comments_spaced(trivia, Some(first.kind()), true, &mut docs);
+            let previous = self.skip_leading.replace(Some(first.text_range().start()));
+            docs.push(self.laid_out(node));
+            self.skip_leading.set(previous);
+            return concat(docs);
+        }
+        self.laid_out(node)
+    }
+
+    fn laid_out(&self, node: &SyntaxNode) -> Doc {
         let doc = match node.kind() {
             COMPILATION_UNIT => Some(self.compilation_unit(node)),
             MODULE_DECL => self.module_decl(node),
+            MODULE_DIRECTIVE => self.module_directive(node),
             MODIFIERS => Some(self.modifiers(node)),
             CLASS_DECL | INTERFACE_DECL | ENUM_DECL | RECORD_DECL | ANNOTATION_TYPE_DECL => {
                 self.type_decl(node)
@@ -351,8 +414,11 @@ impl<'a> Formatter<'a> {
             CLASS_BODY => self.class_body(node),
             BLOCK | SWITCH_BLOCK => self.block(node),
             SWITCH_GROUP => Some(self.switch_group(node)),
+            SWITCH_RULE => self.switch_rule(node),
+            CASE_LABEL => self.case_label(node, self.tag()),
             IF_STMT => self.if_stmt(node),
             WHILE_STMT => self.loop_stmt(node),
+            DO_STMT => self.do_stmt(node),
             FOR_STMT => self.for_stmt(node),
             FOREACH_STMT => self.foreach_stmt(node),
             LABELED_STMT => self.labeled_stmt(node),
@@ -364,6 +430,10 @@ impl<'a> Formatter<'a> {
             METHOD_CALL | FIELD_ACCESS => Some(self.chain(node)),
             ARG_LIST | PARAM_LIST | LAMBDA_PARAMS | ANNOTATION_ARGS => self.list(node, None),
             CAST_EXPR => self.cast(node),
+            INSTANCEOF_EXPR => self.instance_of(node),
+            METHOD_REF => self.method_ref(node),
+            CLASS_LITERAL => self.class_literal(node),
+            TYPE_PARAM => self.type_param(node),
             ARRAY_INIT => self.array_init(node),
             LAMBDA_EXPR => self.lambda(node),
             _ => None,
@@ -474,14 +544,24 @@ impl<'a> Formatter<'a> {
                 self.token(close),
             ]));
         }
+        // Directives of one kind (`requires`, `exports`, ...) are packed
+        // together, and a blank line sets each kind apart from the next,
+        // whatever blank lines the source has.
         let mut body = Vec::new();
+        let mut previous: Option<String> = None;
         for directive in elements[open + 1..elements.len() - 1].iter() {
-            body.push(
-                directive
-                    .as_node()
-                    .map_or(Doc::HardLine, |node| self.separator(node)),
-            );
-            body.push(self.element(directive));
+            let kind = first_of(directive).map(|first| first.text().to_string());
+            // A blank line above a comment is the author's, and stays.
+            let commented = directive
+                .as_node()
+                .is_some_and(|node| self.has_leading_comments(node));
+            body.push(match (&previous, directive.as_node()) {
+                (Some(previous), _) if Some(previous) != kind.as_ref() => Doc::BlankLine,
+                (Some(_), Some(node)) if commented => self.separator(node),
+                _ => Doc::HardLine,
+            });
+            body.push(self.with_comments(directive));
+            previous = kind;
         }
         self.dangling_comments(close, &mut body);
         Some(concat(vec![
@@ -490,6 +570,39 @@ impl<'a> Formatter<'a> {
             Doc::HardLine,
             self.token_without_leading(close),
         ]))
+    }
+
+    /// `exports a.b to c, d;`: the names after `to` or `with` take a line
+    /// each, under the directive.
+    fn module_directive(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let is_word = |el: &SyntaxElement, words: &[&str]| {
+            el.as_token()
+                .is_some_and(|token| token.kind() == IDENT && words.contains(&token.text()))
+        };
+        if !is_word(elements.first()?, &["exports", "opens", "provides"]) {
+            return None;
+        }
+        // The first `to` or `with` that is a word of its own, not part of
+        // a dotted name.
+        let keyword = (2..elements.len()).find(|&i| {
+            is_word(&elements[i], &["to", "with"])
+                && elements[i - 1].kind() != DOT
+                && elements.get(i + 1).is_some_and(|next| next.kind() != DOT)
+        })?;
+        let names: Vec<&[SyntaxElement]> = elements[keyword + 1..]
+            .split_inclusive(|el| el.kind() == COMMA)
+            .collect();
+        // Each name takes a line, even when there is only one.
+        let mut list = Vec::new();
+        for name in &names {
+            list.push(Doc::HardLine);
+            list.push(self.spaced(name));
+        }
+        Some(group(concat(vec![
+            self.spaced(&elements[..=keyword]),
+            indent(self.continuation_indent(), concat(list)),
+        ])))
     }
 
     // --- Declarations ------------------------------------------------------
@@ -611,8 +724,8 @@ impl<'a> Formatter<'a> {
         };
         let split = elements.iter().position(|el| is_tail(el.kind()))?;
         let mut docs = vec![self.spaced(&elements[..split])];
-        // Type parameters and record components, which the first clause is
-        // grouped with: if they wrap, so does it.
+        // Type parameters, which the first clause is grouped with: if they
+        // wrap, so does it.
         let mut before_clauses = Vec::new();
         for element in &elements[split..] {
             match element {
@@ -632,6 +745,12 @@ impl<'a> Formatter<'a> {
                     docs.append(&mut before_clauses);
                     docs.push(space());
                     docs.push(self.node(body));
+                }
+                // Record components wrap on their own: `implements` stays
+                // after their `)` if it fits there.
+                NodeOrToken::Node(components) if components.kind() == PARAM_LIST => {
+                    docs.append(&mut before_clauses);
+                    docs.push(self.node(components));
                 }
                 NodeOrToken::Node(node) if is_tail(node.kind()) => {
                     before_clauses.push(self.node(node));
@@ -925,7 +1044,9 @@ impl<'a> Formatter<'a> {
     }
 
     /// A parameter: the name moves to the next line if the type leaves no
-    /// room for it.
+    /// room for it. After modifiers, the lines the parameter goes on to are
+    /// indented once more, and annotations in front of the type leave it
+    /// the next line if the parameter does not fit on one.
     fn param(&self, node: &SyntaxNode) -> Option<Doc> {
         let elements: Vec<SyntaxElement> = significant_children(node).collect();
         let (name, before) = elements.split_last()?;
@@ -933,25 +1054,47 @@ impl<'a> Formatter<'a> {
         if name.kind() != IDENT || ty.as_node().is_none_or(|ty| ty.kind() == MODIFIERS) {
             return None;
         }
-        let mut docs = Vec::new();
-        match modifiers {
-            [] => {}
-            [modifiers] if modifiers.kind() == MODIFIERS => {
-                docs.push(self.element(modifiers));
-                docs.push(space());
-            }
-            _ => return None,
-        }
+        let continuation = self.continuation_indent();
+        let mut declaration = Vec::new();
         if ty.kind() == UNION_TYPE {
-            docs.push(self.element(ty));
-            docs.push(space());
+            declaration.push(self.element(ty));
+            declaration.push(space());
         } else {
-            docs.push(group(concat(vec![
-                indent(self.continuation_indent(), self.element(ty)),
-                indent(self.continuation_indent(), Doc::Line),
+            declaration.push(group(concat(vec![
+                indent(continuation, self.element(ty)),
+                indent(continuation, Doc::Line),
             ])));
         }
-        docs.push(self.element(name));
+        declaration.push(self.element(name));
+        let modifiers = match modifiers {
+            [] => return Some(concat(declaration)),
+            [modifiers] if modifiers.kind() == MODIFIERS => modifiers.as_node()?,
+            _ => return None,
+        };
+        let parts: Vec<SyntaxElement> = significant_children(modifiers).collect();
+        // Annotations after a keyword, and known type annotations, belong
+        // to the type and stay with it.
+        let declaration_annotations = self.declaration_annotations(modifiers);
+        let breaks = !parts.is_empty() && declaration_annotations == parts.len();
+        let only_type_annotations =
+            declaration_annotations == 0 && parts.iter().all(|part| part.kind() == ANNOTATION);
+        if only_type_annotations {
+            return Some(concat(vec![
+                self.node(modifiers),
+                space(),
+                concat(declaration),
+            ]));
+        }
+        // A comment above the parameter is not part of what wraps.
+        let (mut docs, modifiers) = self.with_first_comments_apart(&parts, || self.node(modifiers));
+        docs.push(group(indent(
+            continuation,
+            concat(vec![
+                modifiers,
+                if breaks { Doc::Line } else { space() },
+                concat(declaration),
+            ]),
+        )));
         Some(concat(docs))
     }
 
@@ -1161,11 +1304,83 @@ impl<'a> Formatter<'a> {
         concat(labels)
     }
 
+    /// `case A, B` or `case Type t when condition`: constants after the
+    /// first wrap one per line, and a guard moves to a line of its own. The
+    /// group that decides is tagged `wrapped`.
+    fn case_label(&self, node: &SyntaxNode, wrapped: Tag) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let (keyword, rest) = elements.split_first()?;
+        if rest.is_empty() {
+            return None;
+        }
+        let mut first = Vec::new();
+        let mut others = Vec::new();
+        for (i, element) in rest.iter().enumerate() {
+            let target = if others.is_empty() && element.kind() != GUARD {
+                &mut first
+            } else {
+                &mut others
+            };
+            target.push(self.element(element));
+            let next = rest.get(i + 1);
+            // A line may break after each comma, and before a guard.
+            if (element.kind() == COMMA && next.is_some())
+                || next.is_some_and(|next| next.kind() == GUARD)
+            {
+                others.push(Doc::Line);
+            }
+        }
+        Some(tagged_group(
+            wrapped,
+            concat(vec![
+                self.element(keyword),
+                space(),
+                concat(first),
+                indent(self.continuation_indent(), concat(others)),
+            ]),
+        ))
+    }
+
+    /// `case A -> value;`: a value that is not a block moves to the next
+    /// line if it does not fit, and always when the label has wrapped.
+    fn switch_rule(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let [label, arrow, body] = elements.as_slice() else {
+            return None;
+        };
+        let label_node = label.as_node().filter(|label| label.kind() == CASE_LABEL)?;
+        let wrapped = self.tag();
+        let label = self
+            .case_label(label_node, wrapped)
+            .unwrap_or_else(|| self.generic(label_node));
+        let mut docs = vec![label, space(), self.element(arrow)];
+        if body.kind() == BLOCK {
+            docs.push(space());
+            docs.push(self.element(body));
+        } else {
+            docs.push(group_if(
+                wrapped,
+                indent(
+                    self.continuation_indent(),
+                    concat(vec![Doc::Line, self.element(body)]),
+                ),
+            ));
+        }
+        Some(concat(docs))
+    }
+
     /// The body of an `if` or loop: a block stays on the same line, any
     /// other statement moves to the next line if it does not fit.
     fn body(&self, statement: &SyntaxElement) -> Doc {
         if statement.kind() == BLOCK {
             return concat(vec![space(), self.element(statement)]);
+        }
+        // An empty statement always gets the next line to itself.
+        if statement.kind() == EMPTY_STMT {
+            return indent(
+                self.block_indent(),
+                concat(vec![Doc::HardLine, self.element(statement)]),
+            );
         }
         // `if (ready) // why`: google-java-format starts the statement on
         // the next line, at the `if`'s own indentation. The comment's line
@@ -1283,6 +1498,29 @@ impl<'a> Formatter<'a> {
         let (body, header) = elements.split_last()?;
         body.as_node()?;
         Some(concat(vec![self.spaced(header), self.body(body)]))
+    }
+
+    /// `do body while (condition);`: after a body that is not a block,
+    /// `while` starts a line.
+    fn do_stmt(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let [keyword, body, rest @ ..] = elements.as_slice() else {
+            return None;
+        };
+        if keyword.kind() != DO_KW || rest.first()?.kind() != WHILE_KW {
+            return None;
+        }
+        body.as_node()?;
+        Some(concat(vec![
+            self.element(keyword),
+            self.body(body),
+            if body.kind() == BLOCK {
+                space()
+            } else {
+                Doc::HardLine
+            },
+            self.spaced(rest),
+        ]))
     }
 
     /// `label:` on its own line, above the statement it names.
@@ -1481,6 +1719,9 @@ impl<'a> Formatter<'a> {
                 .map(|el| el.to_string())
         };
         let base_kind = base_node.as_ref().map(|base| base.kind());
+        // The name that follows a class name, if the chain ends with it:
+        // `Constants.A_NAME`, `java.util.Map.Entry`.
+        let mut after_class = None;
         let attached = match base_kind {
             Some(NAME_EXPR) => {
                 let base_name = base_node.as_ref().map_or(String::new(), |b| b.to_string());
@@ -1495,16 +1736,34 @@ impl<'a> Formatter<'a> {
                         .filter_map(name_of),
                 );
                 match names.iter().rposition(|name| is_class_name(name)) {
-                    Some(class) => class + 1,
+                    Some(class) => {
+                        if class + 1 == links.len() && class + 2 == names.len() {
+                            after_class = Some(class);
+                        }
+                        class + 1
+                    }
                     None if base_name.chars().count() <= 4 => 1,
                     None => 0,
                 }
             }
-            Some(THIS_EXPR | SUPER_EXPR) => 1,
+            // `this.x`, but not `Outer.this.x`.
+            Some(THIS_EXPR | SUPER_EXPR) => usize::from(
+                base_node
+                    .as_ref()
+                    .is_some_and(|base| significant_children(base).count() == 1),
+            ),
+            // `Type.class.getMethods()[0]`: a chain that is indexed keeps
+            // the first call with the class literal.
+            Some(CLASS_LITERAL) => usize::from(
+                node.parent()
+                    .is_some_and(|parent| parent.kind() == ARRAY_ACCESS),
+            ),
             _ => 0,
         }
         .min(links.len());
-        // The head also runs up to the last `.stream()` or `.toBuilder()`.
+        // The head also runs up to the last `.stream()` or `.toBuilder()`,
+        // while that much fits on a line.
+        let named = attached;
         let attached = links
             .iter()
             .rposition(|link| {
@@ -1514,10 +1773,24 @@ impl<'a> Formatter<'a> {
                     })
             })
             .map_or(attached, |last| attached.max(last + 1));
-        // What follows the body of an anonymous class stays on its `}`.
-        let attached = match &base_node {
-            Some(base) if base.children().any(|child| child.kind() == CLASS_BODY) => links.len(),
-            _ => attached,
+        // What follows the body of an anonymous class stays on its `}`: all
+        // of it after a body with members, the first link after `{}`.
+        let (named, attached) = match &base_node {
+            Some(base) if base.children().any(|child| child.kind() == CLASS_BODY) => {
+                let empty = base
+                    .children()
+                    .filter(|child| child.kind() == CLASS_BODY)
+                    .all(|body| significant_children(&body).count() == 2);
+                if empty {
+                    (
+                        named.max(1).min(links.len()),
+                        attached.max(1).min(links.len()),
+                    )
+                } else {
+                    (links.len(), links.len())
+                }
+            }
+            _ => (named, attached),
         };
 
         // In the head of a chain that goes on, a block lambda is an ordinary
@@ -1539,8 +1812,57 @@ impl<'a> Formatter<'a> {
                 }
             }
         }
+        // The dot before a name that follows a class name gives way if not
+        // even the name fits on the line: `Constants` and, under it,
+        // `.A_VERY_LONG_NAME`.
+        let attached_link = |(i, link): (usize, &Vec<SyntaxElement>)| {
+            if after_class != Some(i) {
+                return self.spaced(link);
+            }
+            group(indent(
+                self.continuation_indent(),
+                concat(vec![Doc::SoftLine, self.spaced(link)]),
+            ))
+        };
         let mut head = vec![self.spaced(&base_elements)];
-        head.extend(links[..attached].iter().map(|link| self.spaced(link)));
+        head.extend(links[..named].iter().enumerate().map(attached_link));
+        // The head runs up to the last `.stream()` that it reaches on one
+        // line. `with_streams` puts each `.stream()` in a group around the
+        // head so far: the outermost group that fits stays whole, and the
+        // links of those that do not fit take a line each.
+        let streams: Vec<usize> = (named..attached)
+            .filter(|&i| {
+                is_call(&links[i])
+                    && name_of(&links[i]).is_some_and(|name| {
+                        matches!(name.as_str(), "stream" | "parallelStream" | "toBuilder")
+                    })
+            })
+            .collect();
+        let with_streams = |head: Doc| {
+            let mut doc = head;
+            let mut start = named;
+            for &stream in &streams {
+                let mut loose = Vec::new();
+                for link in &links[start..=stream] {
+                    loose.push(Doc::SoftLine);
+                    loose.push(self.spaced(link));
+                }
+                doc = group(concat(vec![
+                    doc,
+                    indent(self.continuation_indent(), concat(loose)),
+                ]));
+                start = stream + 1;
+            }
+            // Past the last `.stream()` only what an anonymous class's body
+            // holds on to can remain.
+            let mut docs = vec![doc];
+            docs.extend(
+                links[start.min(attached)..attached]
+                    .iter()
+                    .map(|link| self.spaced(link)),
+            );
+            concat(docs)
+        };
         let calls = links.iter().filter(|link| is_call(link)).count();
         // What an array access is made of is laid out on its own.
         let simple_base = matches!(
@@ -1572,9 +1894,11 @@ impl<'a> Formatter<'a> {
             ));
             return concat(head);
         }
-        if rest.is_empty() || (calls == 0 && rest.len() < 2) {
-            head.extend(rest.iter().map(|link| self.spaced(link)));
-            return concat(head);
+        // `f(x).length` may wrap before its dot; `a.length` may not.
+        if rest.is_empty() || (calls == 0 && rest.len() < 2 && simple_base) {
+            let mut docs = vec![with_streams(concat(head))];
+            docs.extend(rest.iter().map(|link| self.spaced(link)));
+            return concat(docs);
         }
 
         let mut tail = Vec::new();
@@ -1585,10 +1909,79 @@ impl<'a> Formatter<'a> {
         tagged_group(
             tag,
             concat(vec![
-                indent_if(tag, self.continuation_indent(), concat(head)),
+                with_streams(indent_if(tag, self.continuation_indent(), concat(head))),
                 indent(self.continuation_indent(), concat(tail)),
             ]),
         )
+    }
+
+    /// `value instanceof Type`: wraps before `instanceof`, like a binary
+    /// operator.
+    fn instance_of(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let keyword = elements
+            .iter()
+            .position(|el| el.kind() == INSTANCEOF_KW)
+            .filter(|keyword| *keyword == 1)?;
+        Some(group(indent(
+            self.continuation_indent(),
+            concat(vec![
+                self.element(&elements[0]),
+                Doc::Line,
+                self.spaced(&elements[keyword..]),
+            ]),
+        )))
+    }
+
+    /// `target::name`: wraps before the `::` if it does not fit.
+    fn method_ref(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let colons = elements
+            .iter()
+            .position(|el| el.kind() == COLON_COLON)
+            .filter(|colons| *colons == 1)?;
+        Some(group(indent(
+            self.continuation_indent(),
+            concat(vec![
+                self.element(&elements[0]),
+                Doc::SoftLine,
+                self.spaced(&elements[colons..]),
+            ]),
+        )))
+    }
+
+    /// `Type.class`: wraps before the `.` if not even that fits.
+    fn class_literal(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let [ty, dot, class] = elements.as_slice() else {
+            return None;
+        };
+        Some(group(concat(vec![
+            self.element(ty),
+            indent(
+                self.continuation_indent(),
+                concat(vec![Doc::SoftLine, self.element(dot), self.element(class)]),
+            ),
+        ])))
+    }
+
+    /// `T extends Bound`: the bound moves to the next line if it does not
+    /// fit.
+    fn type_param(&self, node: &SyntaxNode) -> Option<Doc> {
+        let elements: Vec<SyntaxElement> = significant_children(node).collect();
+        let (bound, name) = elements.split_last()?;
+        let bound = bound.as_node().filter(|bound| bound.kind() == TYPE_BOUND)?;
+        let parts: Vec<SyntaxElement> = significant_children(bound).collect();
+        let (keyword, types) = parts.split_first()?;
+        Some(concat(vec![
+            self.spaced(name),
+            space(),
+            self.element(keyword),
+            group(indent(
+                self.continuation_indent(),
+                concat(vec![Doc::Line, self.spaced(types)]),
+            )),
+        ]))
     }
 
     /// `(Type) value`: the value moves to the next line if it does not fit.
@@ -1615,9 +2008,10 @@ impl<'a> Formatter<'a> {
     ///
     /// - a lambda that is the only argument starts on the line of the call;
     /// - arguments written two to a line, as the keys and values of
-    ///   `ImmutableMap.of`, stay that way;
-    /// - short arguments fill lines instead of taking one each, and so do
-    ///   the arguments after a format string.
+    ///   `ImmutableMap.of`, stay that way (see [`Formatter::table_width`]);
+    /// - short arguments fill lines instead of taking one each;
+    /// - the arguments after a format string wrap apart from it: all on
+    ///   the line after it, or one per line.
     fn list(&self, node: &SyntaxNode, one_per_line: Option<Tag>) -> Option<Doc> {
         let elements: Vec<SyntaxElement> = significant_children(node).collect();
         let (open, rest) = elements.split_first()?;
@@ -1677,12 +2071,31 @@ impl<'a> Formatter<'a> {
                 self.element(close),
             ]));
         }
+        // `@A(x = 1, y = 2)`: several named values that do not fit after
+        // the `(` take a line each.
+        if node.kind() == ANNOTATION_ARGS && pairs.len() > 1 {
+            let (mut inner, values) =
+                self.with_first_comments_apart(items, || self.comma_separated(items));
+            inner.insert(0, Doc::SoftLine);
+            inner.push(values);
+            inner.push(self.element(close));
+            return Some(concat(vec![
+                self.element(open),
+                group(indent(continuation, concat(inner))),
+            ]));
+        }
         if node.kind() != ARG_LIST {
             return Some(wrapped(&|| self.comma_separated(items)));
         }
 
+        // A comment after the `(` puts every argument on a line of its own.
+        let open_commented = open
+            .as_token()
+            .and_then(|open| self.trivia(open))
+            .is_some_and(|trivia| trivia.trailing.iter().any(|comment| comment.is_line));
         if let [NodeOrToken::Node(only)] = items
             && only.kind() == LAMBDA_EXPR
+            && !open_commented
         {
             let block = only
                 .children()
@@ -1693,11 +2106,23 @@ impl<'a> Formatter<'a> {
                 .borrow()
                 .contains(&node.text_range().start());
             if !block {
+                let lambda = self.node(only);
+                // A comment after the lambda puts the `)` on a line of its
+                // own, and then the lambda is an ordinary argument.
+                let commented = last_token(only)
+                    .and_then(|last| {
+                        self.trivia(&last)
+                            .map(|t| t.trailing.iter().any(|c| c.is_line))
+                    })
+                    .unwrap_or(false);
+                if commented {
+                    return Some(wrapped(&|| self.comma_separated(items)));
+                }
                 // `f(() -> value)`, or the lambda on the next line if it
                 // fits there, or `f(() ->` with the value below.
                 return Some(concat(vec![
                     self.element(open),
-                    next_line_if_fits(continuation, self.node(only)),
+                    next_line_if_fits(continuation, lambda),
                     self.element(close),
                 ]));
             }
@@ -1711,11 +2136,21 @@ impl<'a> Formatter<'a> {
         }
         let arguments: Vec<&[SyntaxElement]> =
             items.split_inclusive(|el| el.kind() == COMMA).collect();
-        if self.is_written_in_pairs(&arguments) {
+        // Arguments keep their rows only as pairs, with none left over.
+        if arguments.len().is_multiple_of(2) && self.table_width(&arguments) == Some(2) {
             let mut inner = Vec::new();
-            for (i, argument) in arguments.iter().enumerate() {
-                inner.push(if i % 2 == 0 { Doc::HardLine } else { space() });
-                inner.push(self.spaced(argument));
+            for pair in arguments.chunks(2) {
+                inner.push(Doc::HardLine);
+                let (comments, key) = self.item_with_comments_apart(pair[0]);
+                inner.extend(comments);
+                let mut row = vec![key];
+                if let Some(value) = pair.get(1) {
+                    row.push(indent(
+                        continuation,
+                        concat(vec![Doc::Line, self.spaced(value)]),
+                    ));
+                }
+                inner.push(group(concat(row)));
             }
             // As in `wrapped`, the `)` is indented like the arguments if a
             // trailing comment puts it on a line of its own.
@@ -1732,8 +2167,16 @@ impl<'a> Formatter<'a> {
             && others.len() > 1
             && is_format_string(first)
         {
+            let rest: Vec<SyntaxElement> = others
+                .iter()
+                .flat_map(|item| item.iter().cloned())
+                .collect();
             return Some(wrapped(&|| {
-                concat(vec![self.spaced(first), Doc::Line, self.filled(others)])
+                concat(vec![
+                    self.spaced(first),
+                    Doc::Line,
+                    group(self.comma_separated(&rest)),
+                ])
             }));
         }
         Some(wrapped(&|| self.comma_separated(items)))
@@ -1779,7 +2222,8 @@ impl<'a> Formatter<'a> {
             .split_whitespace()
             .map(|word| word.chars().count() + 1)
             .sum();
-        !commented && width.saturating_sub(1) < 10
+        let text_block = tokens.iter().any(|token| token.kind() == TEXT_BLOCK);
+        !commented && !text_block && width.saturating_sub(1) < 10
     }
 
     /// Whether the items of a list fill lines rather than take one each:
@@ -1790,7 +2234,21 @@ impl<'a> Formatter<'a> {
                 .first()
                 .and_then(first_of)
                 .is_some_and(|first| self.trivia(&first).is_some_and(|t| !t.leading.is_empty()));
-            self.is_short(item) && (i == 0 || !own_line_comment)
+            // A comment after the last item counts as part of it: a long
+            // one makes the item long, and then every item gets a line.
+            let comment_after_last =
+                if i + 1 == items.len() && item.last().is_some_and(|last| last.kind() != COMMA) {
+                    item.iter()
+                        .filter_map(last_of)
+                        .filter_map(|last| self.trivia(&last))
+                        .flat_map(|trivia| trivia.trailing.iter())
+                        .map(|comment| comment.text.trim_end().chars().count() + 1)
+                        .sum::<usize>()
+                } else {
+                    0
+                };
+            let trailing_comment = comment_after_last >= 10;
+            self.is_short(item) && (i == 0 || !own_line_comment) && !trailing_comment
         })
     }
 
@@ -1815,28 +2273,68 @@ impl<'a> Formatter<'a> {
             return (Vec::new(), build());
         }
         let mut comments = Vec::new();
-        self.leading_comments(trivia, Some(first.kind()), &mut comments);
+        self.leading_comments_spaced(trivia, Some(first.kind()), true, &mut comments);
         let previous = self.skip_leading.replace(Some(start));
         let doc = build();
         self.skip_leading.set(previous);
         (comments, doc)
     }
 
-    /// Whether the source has the arguments two to a line, on at least two
-    /// lines, starting on the line after the `(`.
-    fn is_written_in_pairs(&self, arguments: &[&[SyntaxElement]]) -> bool {
-        if arguments.len() < 4 || !arguments.len().is_multiple_of(2) {
-            return false;
+    /// How many items the source puts on each line of a list that it
+    /// writes as a table, or `None` if it is not written as one.
+    ///
+    /// As google-java-format sees it, a table has at least two rows. Each
+    /// row starts in the column of the first item, on a line after the
+    /// opening bracket, and nothing starts to the left of that column. All
+    /// rows are as long as the first, except that the last of three or more
+    /// may be shorter. And the columns hold like things: the first items of
+    /// all rows are one kind of expression, and in every other column more
+    /// than half of the rows agree on one.
+    fn table_width(&self, items: &[&[SyntaxElement]]) -> Option<usize> {
+        let mut rows: Vec<Vec<&SyntaxElement>> = Vec::new();
+        let mut margin = 0;
+        for (i, item) in items.iter().enumerate() {
+            let value = item.first()?;
+            let column = self.source_column(&first_of(value)?);
+            if i == 0 {
+                margin = column;
+            }
+            match column.cmp(&margin) {
+                std::cmp::Ordering::Less => return None,
+                std::cmp::Ordering::Equal => rows.push(vec![value]),
+                std::cmp::Ordering::Greater => rows.last_mut()?.push(value),
+            }
         }
-        arguments.iter().enumerate().all(|(i, argument)| {
-            let Some(first) = argument.first().and_then(first_of) else {
-                return false;
-            };
-            let trivia = self.trivia(&first);
-            let commented = trivia.is_some_and(|t| !t.leading.is_empty());
-            let on_new_line = trivia.is_some_and(|t| t.newlines_before > 0);
-            !commented && on_new_line == (i % 2 == 0)
-        })
+        let width = rows.first()?.len();
+        let (last, full) = rows.split_last()?;
+        let regular = match full.len() {
+            0 => false,
+            1 => last.len() == width,
+            _ => full.iter().all(|row| row.len() == width) && last.len() <= width,
+        };
+        if !regular {
+            return None;
+        }
+        let agree = |column: usize, at_least: usize| {
+            let mut kinds: Vec<String> = rows
+                .iter()
+                .filter_map(|row| row.get(column))
+                .map(|value| expression_kind(value))
+                .collect();
+            kinds.sort();
+            kinds
+                .chunk_by(|a, b| a == b)
+                .any(|same| same.len() >= at_least)
+        };
+        (agree(0, rows.len()) && (1..width).all(|column| agree(column, rows.len() / 2 + 1)))
+            .then_some(width)
+    }
+
+    /// An item of a list, with its comma, and apart from it the comments in
+    /// front of it: for a caller that groups the item, which comments on
+    /// lines of their own must not break.
+    fn item_with_comments_apart(&self, item: &[SyntaxElement]) -> (Vec<Doc>, Doc) {
+        self.with_first_comments_apart(item, || self.spaced(item))
     }
 
     fn comma_separated(&self, items: &[SyntaxElement]) -> Doc {
@@ -1856,6 +2354,8 @@ impl<'a> Formatter<'a> {
     }
 
     /// `{a, b}`, or with the braces on their own lines if it does not fit.
+    /// Values written as a table (see [`Formatter::table_width`]) keep
+    /// their rows; a row that is too long fills further, indented lines.
     fn array_init(&self, node: &SyntaxNode) -> Option<Doc> {
         let elements: Vec<SyntaxElement> = significant_children(node).collect();
         let (open, rest) = elements.split_first()?;
@@ -1867,14 +2367,63 @@ impl<'a> Formatter<'a> {
         let values: Vec<&[SyntaxElement]> =
             items.split_inclusive(|el| el.kind() == COMMA).collect();
         let trailing_comma = items.last().is_some_and(|last| last.kind() == COMMA);
+        // A table one value wide is one only if its rows are arrays of
+        // their own, of two values or more.
+        let is_row = |value: &&[SyntaxElement]| {
+            value
+                .first()
+                .and_then(|value| value.as_node())
+                .is_some_and(|value| {
+                    std::iter::once(value.clone())
+                        .chain(value.children())
+                        .find(|node| node.kind() == ARRAY_INIT)
+                        .filter(|_| matches!(value.kind(), ARRAY_INIT | ARRAY_CREATION_EXPR))
+                        .is_some_and(|rows| {
+                            rows.children_with_tokens().any(|el| el.kind() == COMMA)
+                        })
+                })
+        };
+        let table = self
+            .table_width(&values)
+            .filter(|width| *width > 1 || values.iter().all(is_row));
+        if let Some(width) = table {
+            let mut inner = Vec::new();
+            for row in values.chunks(width) {
+                inner.push(Doc::HardLine);
+                let (comments, first) = self.item_with_comments_apart(row[0]);
+                inner.extend(comments);
+                let rest = row[1..]
+                    .iter()
+                    .map(|item| fill_break(self.spaced(item)))
+                    .collect();
+                inner.push(group(concat(vec![
+                    first,
+                    indent(self.continuation_indent(), concat(rest)),
+                ])));
+            }
+            self.dangling_comments(close, &mut inner);
+            return Some(concat(vec![
+                self.element(open),
+                indent(self.block_indent(), concat(inner)),
+                Doc::HardLine,
+                self.token_without_leading(close),
+            ]));
+        }
         // A trailing comma puts the braces on lines of their own.
         let first = if trailing_comma {
             Doc::HardLine
         } else {
             Doc::SoftLine
         };
+        // In an annotation, values that do not fill lines wrap with the
+        // braces: one per line as soon as the braces are on their own.
+        let in_annotation = node
+            .parent()
+            .is_some_and(|parent| matches!(parent.kind(), ANNOTATION_ARGS | ANNOTATION_PAIR));
         let mut inner = if self.fills(&values) {
             vec![first, group(self.filled(&values))]
+        } else if in_annotation {
+            vec![first, self.comma_separated(items)]
         } else {
             vec![first, group(self.comma_separated(items))]
         };
@@ -1903,8 +2452,87 @@ impl<'a> Formatter<'a> {
     }
 }
 
-/// Whether an argument is a string literal with a `%` conversion in it, or
-/// a concatenation of string literals with one.
+/// What kind of expression an item of a list is, as far as lining up the
+/// columns of a table goes: `1` and `-2` are alike, `1` and `"a"` are not,
+/// and neither are `a + b` and `a - b`.
+fn expression_kind(element: &SyntaxElement) -> String {
+    let NodeOrToken::Node(node) = element else {
+        return format!("{:?}", element.kind());
+    };
+    let tokens = || {
+        significant_children(node)
+            .filter_map(|el| el.into_token())
+            .map(|token| token.text().to_string())
+            .collect::<String>()
+    };
+    match node.kind() {
+        LITERAL => {
+            let Some(token) = first_token(node) else {
+                return "literal".to_string();
+            };
+            let text = token.text();
+            match token.kind() {
+                INT_LITERAL if text.ends_with(['l', 'L']) => "long",
+                INT_LITERAL => "int",
+                FLOAT_LITERAL if text.ends_with(['f', 'F']) => "float",
+                FLOAT_LITERAL => "double",
+                CHAR_LITERAL => "char",
+                STRING_LITERAL | TEXT_BLOCK => "string",
+                NULL_KW => "null",
+                _ => "boolean",
+            }
+            .to_string()
+        }
+        PREFIX_EXPR => {
+            let operand = node.children().next();
+            let number = operand.as_ref().filter(|operand| {
+                operand.kind() == LITERAL
+                    && first_token(operand)
+                        .is_some_and(|token| matches!(token.kind(), INT_LITERAL | FLOAT_LITERAL))
+            });
+            // A negative number is a number.
+            match number {
+                Some(number) if tokens() == "-" => {
+                    expression_kind(&NodeOrToken::Node(number.clone()))
+                }
+                _ => format!("prefix {}", tokens()),
+            }
+        }
+        POSTFIX_EXPR => format!("postfix {}", tokens()),
+        BINARY_EXPR => format!("binary {}", tokens()),
+        ASSIGN_EXPR => format!("assign {}", tokens()),
+        FIELD_ACCESS | CLASS_LITERAL => "select".to_string(),
+        NAME_EXPR | THIS_EXPR | SUPER_EXPR => "name".to_string(),
+        ARRAY_CREATION_EXPR | ARRAY_INIT => "array".to_string(),
+        kind => format!("{kind:?}"),
+    }
+}
+
+/// Whether a node is an expression that has a layout of its own.
+fn is_expression(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        BINARY_EXPR
+            | CONDITIONAL_EXPR
+            | METHOD_CALL
+            | FIELD_ACCESS
+            | CAST_EXPR
+            | INSTANCEOF_EXPR
+            | ASSIGN_EXPR
+            | LAMBDA_EXPR
+            | METHOD_REF
+            | NEW_EXPR
+            | ARRAY_CREATION_EXPR
+            | ARRAY_INIT
+            | ARRAY_ACCESS
+            | CLASS_LITERAL
+            | SWITCH_EXPR
+    )
+}
+
+/// Whether an argument is a format string: a string literal or text block
+/// with a `%` or a `{0}` in it, or a concatenation of string literals with
+/// one.
 fn is_format_string(argument: &[SyntaxElement]) -> bool {
     let Some(NodeOrToken::Node(value)) = argument.first() else {
         return false;
@@ -1914,16 +2542,17 @@ fn is_format_string(argument: &[SyntaxElement]) -> bool {
         .filter_map(|el| el.into_token())
         .filter(|token| !token.kind().is_trivia())
         .collect();
+    let placeholder = |text: &str| {
+        text.contains('%')
+            || text
+                .as_bytes()
+                .windows(3)
+                .any(|window| window[0] == b'{' && window[1].is_ascii_digit() && window[2] == b'}')
+    };
     tokens
         .iter()
-        .all(|token| matches!(token.kind(), STRING_LITERAL | PLUS))
-        && tokens.iter().any(|token| {
-            token
-                .text()
-                .split('%')
-                .skip(1)
-                .any(|rest| rest.starts_with(|c: char| c.is_ascii_alphanumeric()))
-        })
+        .all(|token| matches!(token.kind(), STRING_LITERAL | TEXT_BLOCK | PLUS))
+        && tokens.iter().any(|token| placeholder(token.text()))
 }
 
 /// Whether a comment's text is exactly `$NON-NLS-1$`, with any number.

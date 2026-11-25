@@ -93,11 +93,11 @@ pub(crate) fn package_name(root: &SyntaxNode) -> Option<String> {
     )
 }
 
-/// Whether an import does nothing: it imports from `java.lang` or from the
-/// file's own package, which are in scope anyway.
+/// Whether an import does nothing: it imports a class, or every class, from
+/// `java.lang` or from the file's own package, which are in scope anyway.
 pub(crate) fn is_redundant(is_static: bool, name: &str, package: Option<&str>) -> bool {
     match name.rsplit_once('.') {
-        Some((qualifier, simple)) if !is_static && simple != "*" => {
+        Some((qualifier, _)) if !is_static => {
             qualifier == "java.lang" || Some(qualifier) == package
         }
         _ => false,
@@ -284,9 +284,9 @@ pub(crate) fn fix(text: &str, root: &SyntaxNode) -> Vec<Edit> {
             return Vec::new();
         };
         let (is_static, name) = import_name(import);
-        let keep = name.ends_with('*')
-            || (!is_redundant(is_static, &name, package.as_deref())
-                && name
+        let keep = !is_redundant(is_static, &name, package.as_deref())
+            && (name.ends_with('*')
+                || name
                     .rsplit('.')
                     .next()
                     .is_some_and(|simple| used.contains(simple)));

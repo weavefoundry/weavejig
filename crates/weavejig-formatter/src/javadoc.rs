@@ -9,6 +9,14 @@
 //! The rules were worked out from what google-java-format prints for small
 //! inputs; `tests/fixtures/reference/javadoc*.java` records those.
 
+use std::borrow::Cow;
+
+/// Whether a character separates words. A no-break space does not: it is
+/// part of the word it is in, as in google-java-format.
+fn is_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r')
+}
+
 /// Reflows a Javadoc comment that will be printed starting at `column`.
 /// Returns its lines; every line after the first belongs at `column` too
 /// (each already starts with the space that lines up the stars).
@@ -54,27 +62,65 @@ fn width(text: &str) -> usize {
 }
 
 /// The text of the comment without the `*` that starts each line, and
-/// without the one space that usually follows it.
+/// without the one space that usually follows it. Lines written without a
+/// `*` lose the indentation they all share instead, so that preformatted
+/// text among them keeps its shape.
 fn strip_stars(body: &str) -> String {
+    let starless = |line: &str| {
+        !line.trim_matches(is_space).is_empty()
+            && !line.trim_start_matches(is_space).starts_with('*')
+    };
+    let shared = body
+        .lines()
+        .skip(1)
+        .filter(|line| starless(line))
+        .map(|line| line.chars().take_while(|c| is_space(*c)).count())
+        .min()
+        .unwrap_or(0);
     let mut out = String::with_capacity(body.len());
     for (i, line) in body.lines().enumerate() {
         if i > 0 {
             out.push('\n');
         }
+        if i > 0 && starless(line) {
+            let start = line
+                .char_indices()
+                .nth(shared)
+                .map_or(line.len(), |(index, _)| index);
+            out.push_str(line[start..].trim_end_matches(is_space));
+            continue;
+        }
         let line = if i == 0 {
             line
         } else {
-            let line = line.trim_start();
+            let line = line.trim_start_matches(is_space);
             line.strip_prefix('*').unwrap_or(line)
         };
-        out.push_str(line.strip_prefix(' ').unwrap_or(line).trim_end());
+        out.push_str(
+            line.strip_prefix(' ')
+                .unwrap_or(line)
+                .trim_end_matches(is_space),
+        );
     }
     out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token<'a> {
-    Word(&'a str),
+    /// Text without whitespace in it, or several such joined by single
+    /// spaces where no line may break: before a word that starts with `@`,
+    /// which at the start of a line would read as a block tag.
+    Word(Cow<'a, str>),
+    /// A space that is dropped unless the line breaks there: the one after
+    /// `<a href="...">`.
+    OptionalBreak,
+    /// `<code>`, what it holds exactly as written, and `</code>`. A line
+    /// may break after the opening tag and before the closing one.
+    Code {
+        open: &'a str,
+        content: &'a str,
+        close: &'a str,
+    },
     /// Whitespace within a paragraph.
     Space,
     /// Whitespace with an empty line in it.
@@ -84,8 +130,15 @@ enum Token<'a> {
     /// `<p>`, with the tag as written if it has attributes.
     ParagraphOpen(Option<&'a str>),
     ParagraphClose,
-    /// `<pre>`, `<table>` or `{@snippet}` through its end, kept as written.
+    /// `<table>` or `{@snippet}` through its end, kept as written.
     Verbatim(&'a str),
+    /// `<pre>`, what it holds exactly as written, and `</pre>`. A line may
+    /// break after the opening tag and before the closing one.
+    Pre {
+        open: &'a str,
+        content: &'a str,
+        close: &'a str,
+    },
     /// `<pre>{@code` on one line, the code, then `}</pre>`.
     PreCode {
         open: &'a str,
@@ -134,16 +187,16 @@ fn matching_brace(text: &str) -> Option<usize> {
 fn pre_code(region: &str) -> Option<(&str, &str)> {
     let open_end = region.find('>')? + 1;
     let (open, rest) = region.split_at(open_end);
-    let rest = rest.trim_start();
+    let rest = rest.trim_start_matches(is_space);
     let after_tag = rest.strip_prefix("{@code")?;
     let code_start = after_tag
         .find('\n')
-        .filter(|&newline| after_tag[..newline].trim().is_empty())?
+        .filter(|&newline| after_tag[..newline].trim_matches(is_space).is_empty())?
         + 1;
     let block_end = matching_brace(rest)?;
     let tail = &rest[block_end..];
     let close = find_ignore_case(tail, "</pre>")?;
-    if !tail[..close].trim().is_empty() || tail.len() != close + "</pre>".len() {
+    if !tail[..close].trim_matches(is_space).is_empty() || tail.len() != close + "</pre>".len() {
         return None;
     }
     let code_offset = rest.len() - after_tag.len() + code_start;
@@ -175,23 +228,39 @@ fn special(text: &str) -> Option<(Token<'_>, usize)> {
     let name = rest[..name_len].to_ascii_lowercase();
     let after_name = &rest[name_len..];
     // Attributes may follow the name, but must be set off from it.
-    if !after_name.starts_with(|c: char| c == '>' || c == '/' || c.is_whitespace()) {
+    if !after_name.starts_with(|c: char| c == '>' || c == '/' || is_space(c)) {
         return None;
     }
     let tag_len = text.len() - after_name.len() + after_name.find('>')? + 1;
     let tag = &text[..tag_len];
     let token = match (name.as_str(), closing) {
         ("p", false) => {
-            let plain = after_name.starts_with('>') || after_name.trim_start().starts_with("/>");
+            let plain = after_name.starts_with('>')
+                || after_name.trim_start_matches(is_space).starts_with("/>");
             Token::ParagraphOpen((!plain).then_some(tag))
         }
         ("p", true) => Token::ParagraphClose,
+        ("code", false) => {
+            let close = find_ignore_case(text, "</code>")?;
+            let end = close + "</code>".len();
+            let token = Token::Code {
+                open: tag,
+                content: &text[tag_len..close],
+                close: &text[close..end],
+            };
+            return Some((token, end));
+        }
         ("pre" | "table", false) => {
             let close = format!("</{name}>");
             let end = find_ignore_case(text, &close)? + close.len();
             let region = &text[..end];
             let token = match pre_code(region).filter(|_| name == "pre") {
                 Some((open, code)) => Token::PreCode { open, code },
+                None if name == "pre" => Token::Pre {
+                    open: tag,
+                    content: &region[tag_len..region.len() - close.len()],
+                    close: &region[region.len() - close.len()..],
+                },
                 None => Token::Verbatim(region),
             };
             return Some((token, end));
@@ -215,9 +284,14 @@ fn tokenize(input: &str) -> Vec<Token<'_>> {
     let mut at = 0;
     // Whether only whitespace separates `at` from the start of its line.
     let mut line_start = true;
+    // The end of the inline tag (`{@code ...}`) that `at` is inside. What
+    // an inline tag holds is text: no HTML and no block tags. An empty
+    // line still starts a paragraph there.
+    let mut inline_end = 0;
     while at < input.len() {
         let rest = &input[at..];
-        let blank = rest.len() - rest.trim_start().len();
+        let inline = at < inline_end;
+        let blank = rest.len() - rest.trim_start_matches(is_space).len();
         if blank > 0 {
             let newlines = rest[..blank].matches('\n').count();
             tokens.push(if newlines >= 2 {
@@ -230,37 +304,79 @@ fn tokenize(input: &str) -> Vec<Token<'_>> {
             continue;
         }
         if line_start
+            && !inline
             && rest.starts_with('@')
             && rest[1..].starts_with(|c: char| c.is_ascii_alphabetic())
         {
-            let len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let len = rest.find(is_space).unwrap_or(rest.len());
             tokens.push(Token::BlockTag(&rest[..len]));
             at += len;
             line_start = false;
             continue;
         }
         line_start = false;
-        if let Some((token, len)) = special(rest) {
+        if !inline && let Some((token, len)) = special(rest) {
             tokens.push(token);
             at += len;
             continue;
         }
         // A word runs to the next whitespace or special construct.
-        let mut len = rest.chars().next().map_or(1, char::len_utf8);
+        let mut len = 0;
         while len < rest.len() {
             let tail = &rest[len..];
-            if tail.starts_with(char::is_whitespace)
-                || ((tail.starts_with('<') || tail.starts_with("{@snippet"))
-                    && special(tail).is_some())
+            if at + len >= inline_end
+                && tail.starts_with("{@")
+                && !tail.starts_with("{@snippet")
+                && let Some(end) = matching_brace(tail)
+            {
+                inline_end = at + len + end;
+            }
+            if tail.starts_with(is_space) {
+                break;
+            }
+            if len > 0
+                && at + len >= inline_end
+                && (tail.starts_with('<') || tail.starts_with("{@snippet"))
+                && special(tail).is_some()
             {
                 break;
             }
             len += tail.chars().next().map_or(1, char::len_utf8);
         }
-        tokens.push(Token::Word(&rest[..len]));
+        let word = &rest[..len];
         at += len;
+        // `see @Test`: no line breaks before a word that starts with `@`.
+        if word.starts_with('@')
+            && let [.., Token::Word(previous), Token::Space] = tokens.as_mut_slice()
+        {
+            let joined = format!("{previous} {word}");
+            tokens.pop();
+            tokens.pop();
+            tokens.push(Token::Word(Cow::Owned(joined)));
+            continue;
+        }
+        tokens.push(Token::Word(Cow::Borrowed(word)));
+    }
+    // `<a href="...">` and the link's text have no space between them,
+    // unless the line breaks there.
+    for i in 1..tokens.len() {
+        if tokens[i] == Token::Space
+            && let Token::Word(word) = &tokens[i - 1]
+            && ends_link_tag(word)
+        {
+            tokens[i] = Token::OptionalBreak;
+        }
     }
     tokens
+}
+
+/// Whether a word is the `href="...">` that ends an `<a>` tag.
+fn ends_link_tag(word: &str) -> bool {
+    word.find('>') == Some(word.len() - 1)
+        && word
+            .as_bytes()
+            .get(..5)
+            .is_some_and(|start| start.eq_ignore_ascii_case(b"href="))
 }
 
 /// Whitespace owed before the next thing written. Requests accumulate and
@@ -268,6 +384,8 @@ fn tokenize(input: &str) -> Vec<Token<'_>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Gap {
     None,
+    /// Nothing, or a line break if what comes next does not fit.
+    Soft,
     Space,
     Newline,
     BlankLine,
@@ -302,6 +420,9 @@ struct Writer {
     paragraph_break: bool,
     /// Whitespace is being skipped, after a tag that text attaches to.
     attach: bool,
+    /// Only whitespace has come since a `</p>`: an empty line next to one
+    /// starts no paragraph.
+    after_paragraph_close: bool,
 }
 
 const ITEM_INDENT: usize = 2;
@@ -321,6 +442,7 @@ impl Writer {
             last: Last::Nothing,
             paragraph_break: false,
             attach: false,
+            after_paragraph_close: false,
         }
     }
 
@@ -340,13 +462,19 @@ impl Writer {
 
     fn new_line(&mut self, indent: usize) {
         let line = std::mem::take(&mut self.current);
-        self.lines.push(line.trim_end().to_string());
+        self.lines.push(line.trim_end_matches(is_space).to_string());
         self.current = " ".repeat(indent);
     }
 
     /// Writes `text` after the whitespace owed, starting a line at `indent`
     /// if a line is started.
     fn write(&mut self, text: &str, indent: usize) {
+        self.write_measured(text, indent, width(text));
+    }
+
+    /// [`Writer::write`], with `text` taking `columns` when it is decided
+    /// whether it fits on the line.
+    fn write_measured(&mut self, text: &str, indent: usize, columns: usize) {
         let mut gap = self.gap;
         if !self.wrote_anything {
             gap = Gap::None;
@@ -364,10 +492,15 @@ impl Writer {
             }
             Gap::Newline => self.new_line(indent),
             Gap::Space => {
-                if width(&self.current) + 1 + width(text) > self.available {
+                if width(&self.current) + 1 + columns > self.available {
                     self.new_line(indent);
                 } else {
                     self.current.push(' ');
+                }
+            }
+            Gap::Soft => {
+                if width(&self.current) + columns > self.available {
+                    self.new_line(indent);
                 }
             }
             Gap::None => {}
@@ -383,15 +516,45 @@ impl Writer {
         }
         self.attach = false;
         let starts_paragraph = std::mem::take(&mut self.paragraph_break);
+        let after_paragraph_close = std::mem::take(&mut self.after_paragraph_close);
         let indent = self.indent();
         match token {
             Token::Space => {
                 self.paragraph_break = starts_paragraph;
+                self.after_paragraph_close = after_paragraph_close;
                 self.request(Gap::Space);
             }
+            Token::OptionalBreak => {
+                self.paragraph_break = starts_paragraph;
+                self.request(Gap::Soft);
+            }
             Token::ParagraphBreak => {
-                self.paragraph_break = true;
+                self.paragraph_break = !after_paragraph_close;
+                self.after_paragraph_close = after_paragraph_close;
                 self.request(Gap::Space);
+            }
+            Token::Code {
+                open,
+                content,
+                close,
+            } => {
+                if starts_paragraph && self.last == Last::Text {
+                    self.request(Gap::BlankLine);
+                    self.write("<p>", indent);
+                }
+                self.write(open, indent);
+                let mut lines = content.split('\n');
+                if let Some(first) = lines.next().filter(|first| !first.is_empty()) {
+                    self.gap = Gap::Soft;
+                    self.write(first, indent);
+                }
+                for line in lines {
+                    self.new_line(0);
+                    self.current.push_str(line);
+                }
+                self.gap = Gap::Soft;
+                self.write(close, indent);
+                self.last = Last::Text;
             }
             Token::Word(word) => {
                 // An empty line between two runs of text starts a paragraph.
@@ -428,9 +591,8 @@ impl Writer {
                 self.attach = true;
                 self.last = Last::Block;
             }
-            Token::ParagraphClose | Token::ItemClose => {
-                self.paragraph_break = starts_paragraph;
-            }
+            Token::ParagraphClose => self.after_paragraph_close = true,
+            Token::ItemClose => self.paragraph_break = starts_paragraph,
             Token::Verbatim(region) => {
                 self.request(Gap::BlankLine);
                 let mut lines = region.split('\n');
@@ -439,6 +601,27 @@ impl Writer {
                     self.new_line(0);
                     self.current.push_str(line);
                 }
+                self.request(Gap::BlankLine);
+                self.last = Last::Block;
+            }
+            Token::Pre {
+                open,
+                content,
+                close,
+            } => {
+                self.request(Gap::BlankLine);
+                self.write(open, indent);
+                let mut lines = content.split('\n');
+                if let Some(first) = lines.next().filter(|first| !first.is_empty()) {
+                    self.gap = Gap::Soft;
+                    self.write(first, indent);
+                }
+                for line in lines {
+                    self.new_line(0);
+                    self.current.push_str(line);
+                }
+                self.gap = Gap::Soft;
+                self.write(close, indent);
                 self.request(Gap::BlankLine);
                 self.last = Last::Block;
             }
@@ -451,14 +634,14 @@ impl Writer {
                 }
                 let shared = lines
                     .iter()
-                    .filter(|line| !line.trim().is_empty())
-                    .map(|line| line.len() - line.trim_start().len())
+                    .filter(|line| !line.trim_matches(is_space).is_empty())
+                    .map(|line| line.len() - line.trim_start_matches(is_space).len())
                     .min()
                     .unwrap_or(0);
                 for line in lines {
                     self.new_line(0);
                     self.current
-                        .push_str(line.get(shared..).unwrap_or("").trim_end());
+                        .push_str(line.get(shared..).unwrap_or("").trim_end_matches(is_space));
                 }
                 self.new_line(0);
                 self.current.push_str("}</pre>");
@@ -509,7 +692,7 @@ impl Writer {
                 self.last = Last::Block;
             }
             Token::HeadingClose(tag) => {
-                self.gap = Gap::None;
+                self.gap = Gap::Soft;
                 self.write(tag, indent);
                 self.request(Gap::BlankLine);
                 self.last = Last::Block;
@@ -543,7 +726,7 @@ impl Writer {
     fn finish(&mut self) -> Vec<String> {
         if self.wrote_anything {
             let line = std::mem::take(&mut self.current);
-            self.lines.push(line.trim_end().to_string());
+            self.lines.push(line.trim_end_matches(is_space).to_string());
         }
         while self.lines.last().is_some_and(|line| line.is_empty()) {
             self.lines.pop();

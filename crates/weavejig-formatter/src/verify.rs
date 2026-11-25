@@ -12,7 +12,8 @@ use crate::{imports, modifiers, strings};
 /// What a source file says, ignoring layout.
 #[derive(Debug, PartialEq, Eq)]
 struct Fingerprint {
-    /// Every token outside import declarations, in order, except that each
+    /// Every token outside import declarations, in order, except those that
+    /// do nothing ([`crate::redundant`]), and except that each
     /// run of string literals joined by `+` counts as one token: long
     /// strings are split and their pieces merged again, which leaves the
     /// literals' joined text, and so the string's value, as it was. Each
@@ -49,6 +50,11 @@ fn fingerprint(text: &str) -> Fingerprint {
     let runs = strings::run_tokens(&root);
     let modifier_runs = modifier_runs(&root);
     let (tokens, _) = lex(text);
+    // Tokens that do nothing may be dropped, so they are not compared.
+    let droppable: std::collections::HashSet<usize> = crate::redundant::tokens(&root)
+        .into_iter()
+        .map(|range| usize::from(range.start()))
+        .collect();
     let mut fingerprint = Fingerprint {
         tokens: Vec::new(),
         imports: Vec::new(),
@@ -66,6 +72,7 @@ fn fingerprint(text: &str) -> Fingerprint {
         match token.kind {
             SyntaxKind::WHITESPACE => {}
             kind if kind.is_comment() => comment_words(token_text, &mut fingerprint.comments),
+            _ if droppable.contains(&start) => {}
             _ if start < run_end => {}
             _ if modifier_runs.contains_key(&TextSize::try_from(start).unwrap_or_default()) => {
                 let at = TextSize::try_from(start).unwrap_or_default();
@@ -86,11 +93,12 @@ fn fingerprint(text: &str) -> Fingerprint {
             // `import` is a reserved word: it only ever starts an import.
             SyntaxKind::IMPORT_KW => import = Some(String::new()),
             SyntaxKind::SEMI if import.is_some() => fingerprint.imports.extend(import.take()),
-            // The compiler reads every line terminator in a text block as
-            // `\n` (JLS §3.10.6), so the file's line endings may change them.
+            // A text block is re-indented, which leaves its value alone: the
+            // compiler strips the indentation its lines share, and reads
+            // every line terminator as `\n` (JLS §3.10.6).
             SyntaxKind::TEXT_BLOCK if import.is_none() => fingerprint
                 .tokens
-                .push(token_text.replace("\r\n", "\n").replace('\r', "\n")),
+                .push(crate::textblock::fingerprint(token_text)),
             _ => match &mut import {
                 Some(import) => {
                     import.push_str(token_text);
@@ -112,7 +120,7 @@ fn fingerprint(text: &str) -> Fingerprint {
 /// starts a line, and the tags Javadoc reflow normalises.
 fn comment_words(comment: &str, chars: &mut Vec<char>) {
     // Tags that reflow drops, adds, or rewrites (`<br/>` becomes `<br>`).
-    const DROPPED: [&str; 6] = ["<p>", "</p>", "<p/>", "</li>", "</dt>", "</dd>"];
+    const DROPPED: [&str; 7] = ["<p>", "</p>", "<p/>", "<p />", "</li>", "</dt>", "</dd>"];
     let is_line_comment = comment.starts_with("//");
     let body = comment
         .strip_prefix("/*")
@@ -191,7 +199,8 @@ pub(crate) fn check(original: &str, formatted: &str) -> Result<(), String> {
 
 /// Checks that the imports of the formatted file are those of the original,
 /// except for imports that are unused in the formatted file, or that do
-/// nothing, which may be removed. A wildcard import must stay.
+/// nothing, which may be removed. A wildcard import must stay, unless it is
+/// one that does nothing.
 fn check_imports(before: &[String], after: &[String], formatted: &str) -> Result<(), String> {
     if after.iter().any(|import| !before.contains(import)) {
         return Err("imports would change".to_string());
@@ -215,10 +224,11 @@ fn check_imports(before: &[String], after: &[String], formatted: &str) -> Result
         }
         let name: String = parts.concat();
         let simple = parts.last().copied().unwrap_or_default();
-        if simple == "*" {
+        let redundant = imports::is_redundant(is_static, &name, package.as_deref());
+        if simple == "*" && !redundant {
             return Err(format!("import `{name}` would be removed"));
         }
-        if used.contains(simple) && !imports::is_redundant(is_static, &name, package.as_deref()) {
+        if used.contains(simple) && !redundant {
             return Err(format!("import `{name}` would be removed, but is used"));
         }
     }
@@ -278,7 +288,6 @@ mod tests {
     fn content_changes_are_caught() {
         assert!(check("class A { int x; }", "class A { int y; }").is_err());
         assert!(check("class A { int x; }", "class A { int x }").is_err());
-        assert!(check("class A { int x; }", "class A { int x; ; }").is_err());
         assert!(check("class A { /* a */ }", "class A {}").is_err());
         assert!(check("import a.A; class C { A a; }", "class C { A a; }").is_err());
         assert!(check("import a.*; class C {}", "class C {}").is_err());
@@ -287,6 +296,40 @@ mod tests {
             check(
                 "class A { int x = a >> b; }",
                 "class A { int x = a > > b; }"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn tokens_that_do_nothing_may_go() {
+        assert!(check("class A { int x;; }", "class A { int x; }").is_ok());
+        assert!(
+            check(
+                "@A() class B { Object o = f((x) -> x); }",
+                "@A class B { Object o = f(x -> x); }"
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "import java.lang.*; import a.*; class C {}",
+                "import a.*; class C {}"
+            )
+            .is_ok()
+        );
+        // The empty statement that is a loop's body is not one of them.
+        assert!(
+            check(
+                "class A { void m() { while (a) ; b(); } }",
+                "class A { void m() { while (a) b(); } }"
+            )
+            .is_err()
+        );
+        assert!(
+            check(
+                "class A { Object o = f((x) -> x); }",
+                "class A { Object o = f(x); }"
             )
             .is_err()
         );
