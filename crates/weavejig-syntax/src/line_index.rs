@@ -1,6 +1,6 @@
 //! Maps byte offsets to line and column numbers.
 
-use crate::TextSize;
+use crate::{TextRange, TextSize};
 
 /// A 1-based line and column. Columns count Unicode scalar values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -34,6 +34,22 @@ impl LineIndex {
 
     pub fn line_count(&self) -> usize {
         self.line_starts.len()
+    }
+
+    /// The range of the 1-based `line` in `text`, without its terminator.
+    /// Empty, at the end of the text, for a line past the last.
+    pub fn line_range(&self, text: &str, line: u32) -> TextRange {
+        let index = (line as usize).saturating_sub(1);
+        let len = text.len() as u32;
+        let Some(&start) = self.line_starts.get(index) else {
+            return TextRange::empty(TextSize::new(len));
+        };
+        let next = self.line_starts.get(index + 1).copied().unwrap_or(len);
+        let end = start
+            + text[start as usize..next as usize]
+                .trim_end_matches(['\n', '\r'])
+                .len() as u32;
+        TextRange::new(TextSize::new(start), TextSize::new(end))
     }
 
     /// The line and column of `offset`, which must lie on a character
@@ -70,5 +86,18 @@ mod tests {
         // `é` is two bytes but one column.
         assert_eq!(at(10), (3, 3));
         assert_eq!(at(12), (4, 1));
+    }
+
+    #[test]
+    fn line_ranges() {
+        let text = "ab\ncd\r\n\né f\rg";
+        let index = LineIndex::new(text);
+        let line = |n: u32| &text[index.line_range(text, n)];
+        assert_eq!(line(1), "ab");
+        assert_eq!(line(2), "cd");
+        assert_eq!(line(3), "");
+        assert_eq!(line(4), "é f");
+        assert_eq!(line(5), "g");
+        assert_eq!(line(6), "");
     }
 }

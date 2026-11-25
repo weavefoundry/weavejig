@@ -70,7 +70,11 @@ fn check_reports_problems_and_exits_1() {
     assert!(text.contains("src/A.java:1:16: upper-ell: "), "{text}");
     assert!(text.contains("src/A.java:1:28: need-braces: "), "{text}");
     assert!(
-        text.contains("Found 2 problems in 1 file (2 fixable with `--fix`)."),
+        text.contains("src/A.java:1:38: one-statement-per-line: "),
+        "{text}"
+    );
+    assert!(
+        text.contains("Found 3 problems in 1 file (2 fixable with `--fix`)."),
         "{text}"
     );
 }
@@ -122,7 +126,10 @@ fn check_json_has_exact_locations_and_fixes() {
 #[test]
 fn check_fix_rewrites_files() {
     let dir = project("check_fix", &[("A.java", UNTIDY)]);
-    let output = weavejig(&dir, &["check", "--fix"]);
+    let output = weavejig(
+        &dir,
+        &["check", "--fix", "--select", "upper-ell,need-braces"],
+    );
     assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
     assert!(stdout(&output).contains("Fixed 2 problems."));
     let fixed = fs::read_to_string(dir.join("A.java")).unwrap();
@@ -236,7 +243,7 @@ fn stdin() {
 
 #[test]
 fn configuration_file() {
-    let config = "exclude = [\"generated/**\"]\n\n[format]\nstyle = \"aosp\"\n\n[lint]\nignore = [\"need-braces\"]\n";
+    let config = "exclude = [\"generated/**\"]\n\n[format]\nstyle = \"aosp\"\n\n[lint]\nignore = [\"need-braces\", \"one-statement-per-line\"]\n";
     let dir = project(
         "configuration",
         &[
@@ -330,4 +337,133 @@ fn rules_lists_every_rule() {
         "{ids:?}"
     );
     assert!(rules[0]["checkstyle"].is_string());
+}
+
+#[test]
+fn rules_are_selected_and_configured() {
+    let source = "class A {\n  int big = 12345;\n  int other = 7;\n}\n";
+    let config = "[lint]\nextend-select = [\"magic-number\"]\n\n[lint.rules.magic-number]\nignore-numbers = [7]\n";
+    let dir = project(
+        "rule_options",
+        &[("weavejig.toml", config), ("A.java", source)],
+    );
+    // An opt-in rule, switched on and configured by the file.
+    let output = weavejig(&dir, &["check"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("A.java:2:13: magic-number: "), "{text}");
+    assert!(!text.contains("A.java:3"), "{text}");
+
+    // `--select` runs only what it names, not the file's `extend-select`.
+    let output = weavejig(&dir, &["check", "--select", "upper-ell"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+
+    // `--extend-select` replaces the file's `extend-select`.
+    let output = weavejig(&dir, &["check", "--extend-select", "todo-comment"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+
+    // A mistake in an option is reported, not ignored.
+    let config = "[lint.rules.magic-number]\nignore-number = [7]\n";
+    fs::write(dir.join("weavejig.toml"), config).unwrap();
+    let output = weavejig(&dir, &["check"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("rule `magic-number` has no option `ignore-number`"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn per_file_ignores_and_suppressions() {
+    let config = "[lint.per-file-ignores]\n\"src/test/**\" = [\"upper-ell\"]\n";
+    let noisy = "class A {\n  long x = 1l;\n}\n";
+    let quiet = "class B {\n  long x = 1l; // weavejig-ignore: upper-ell\n\n  @SuppressWarnings(\"weavejig:upper-ell\")\n  long y = 2l;\n}\n";
+    let dir = project(
+        "ignores",
+        &[
+            ("weavejig.toml", config),
+            ("src/main/A.java", noisy),
+            ("src/test/A.java", noisy),
+            ("src/main/B.java", quiet),
+        ],
+    );
+    let output = weavejig(&dir, &["check"]);
+    let text = stdout(&output);
+    assert!(text.contains("src/main/A.java:2:12: upper-ell: "), "{text}");
+    assert!(text.contains("Found 1 problem in 1 file"), "{text}");
+
+    // The glob is relative to the configuration file, wherever we run from.
+    let output = weavejig(&dir.join("src/test"), &["check"]);
+    assert_eq!(stdout(&output), "No problems in 1 file.\n");
+}
+
+#[test]
+fn file_names_reach_the_rules() {
+    let dir = project(
+        "file_names",
+        &[
+            ("Wrong.java", "class Right {}\n"),
+            ("Right.java", "class Right {}\n"),
+        ],
+    );
+    let output = weavejig(&dir, &["check"]);
+    let text = stdout(&output);
+    assert!(
+        text.contains("Wrong.java:1:1: outer-type-filename: "),
+        "{text}"
+    );
+    assert!(text.contains("Found 1 problem in 1 file"), "{text}");
+    // Standard input has no file name to compare with.
+    let output = weavejig_stdin(&dir, &["check", "-"], "class Right {}\n");
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+}
+
+#[test]
+fn rules_list_says_what_can_be_configured() {
+    let dir = project("rules_list", &[]);
+    let output = weavejig(&dir, &["rules", "--output-format", "json"]);
+    let rules: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let rules = rules.as_array().unwrap();
+    let rule = |id: &str| rules.iter().find(|rule| rule["id"] == id).unwrap();
+    assert_eq!(rule("need-braces")["default"], true);
+    assert_eq!(rule("need-braces")["checkstyle"], "NeedBraces");
+    assert_eq!(rule("need-braces")["pmd"], "ControlStatementBraces");
+    let magic = rule("magic-number");
+    assert_eq!(magic["default"], false);
+    let option = &magic["options"][0];
+    assert_eq!(option["name"], "ignore-numbers");
+    assert_eq!(option["type"], "list of strings");
+    assert_eq!(option["default"], serde_json::json!(["-1", "0", "1", "2"]));
+
+    let output = weavejig(&dir, &["rules"]);
+    let text = stdout(&output);
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("magic-number") && line.contains("opt-in"))
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("need-braces") && line.contains("fix"))
+    );
+}
+
+#[test]
+fn readme_lists_every_rule() {
+    let readme =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
+    let dir = project("readme_rules", &[]);
+    let output = weavejig(&dir, &["rules", "--output-format", "json"]);
+    let rules: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    for rule in rules.as_array().unwrap() {
+        let id = rule["id"].as_str().unwrap();
+        let row = readme
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{id}` |")))
+            .unwrap_or_else(|| panic!("README.md has no row for `{id}` in its table of rules"));
+        // The row says the same as the rule about its default and its fix.
+        let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        assert_eq!(cells[3] == "yes", rule["default"] == true, "{id}: default");
+        assert_eq!(cells[4] == "yes", rule["fixable"] == true, "{id}: fix");
+    }
 }

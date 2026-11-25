@@ -1,24 +1,27 @@
 use weavejig_syntax::{SyntaxKind::*, SyntaxNode, SyntaxToken, TextRange, child_token};
 
-use crate::{Diagnostic, Edit, Fix, Rule, RuleMeta};
+use crate::{Context, Diagnostic, Edit, Fix, Rule, RuleMeta};
 
 /// Array brackets belong on the type (`int[] a`), not the name (`int a[]`).
 pub(crate) struct ArrayTypeStyle;
 
-static META: RuleMeta = RuleMeta {
-    id: "array-type-style",
-    summary: "array brackets should be on the type, not the variable name",
-    checkstyle: Some("ArrayTypeStyle"),
-    pmd: None,
-    fixable: true,
-};
+static META: RuleMeta = RuleMeta::new(
+    "array-type-style",
+    "array brackets should be on the type, not the variable name",
+)
+.checkstyle("ArrayTypeStyle")
+.fixable();
 
 impl Rule for ArrayTypeStyle {
     fn meta(&self) -> &'static RuleMeta {
         &META
     }
 
-    fn check_token(&self, token: &SyntaxToken, out: &mut Vec<Diagnostic>) {
+    fn checks_tokens(&self) -> bool {
+        true
+    }
+
+    fn check_token(&self, token: &SyntaxToken, _ctx: &Context<'_>, out: &mut Vec<Diagnostic>) {
         if token.kind() != L_BRACK {
             return;
         }
